@@ -1,0 +1,639 @@
+// Prisma schema for jobwork (local MySQL / MariaDB)
+// Docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum CompanyStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum AnalysisStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum MessageRole {
+  SYSTEM
+  USER
+  ASSISTANT
+}
+
+/// What an uploaded product document is, so we know how to treat it.
+/// Only PRICE_LIST documents are ingested into `price_list_items`.
+enum DocumentKind {
+  PRICE_LIST
+  SPEC
+  DRAWING
+  OTHER
+}
+
+/// Ingestion state for a price-list document (PDF -> structured rows).
+enum IngestStatus {
+  NOT_STARTED
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+/// Lifecycle of a generated quote.
+enum QuoteStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  name      String   @db.VarChar(120)
+  email     String   @unique @db.VarChar(190)
+  phone     String?  @db.VarChar(40)
+  password  String   @db.VarChar(255)
+  roleId    Int?     @map("role_id")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  role             Role?             @relation(fields: [roleId], references: [id])
+  categories       ProductCategory[]
+  companies        Company[]
+  customers        Customer[]
+  analyses         JobworkAnalysis[]
+  productDocuments ProductDocument[]
+  quotes           Quote[]
+  emailLogs        EmailLog[]
+  passwordResets   PasswordReset[]
+
+  @@index([roleId])
+  @@map("users")
+}
+
+/// A named set of permissions. Each user is assigned one role.
+model Role {
+  id          Int      @id @default(autoincrement())
+  name        String   @unique @db.VarChar(80)
+  description String?  @db.VarChar(255)
+  /// Permission keys from the code catalogue, e.g. ["companies.view"]. ["*"] = all.
+  permissions Json
+  /// System roles (e.g. Administrator) cannot be deleted.
+  isSystem    Boolean  @default(false) @map("is_system")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  users User[]
+
+  @@map("roles")
+}
+
+/// Singleton (id = 1) holding app branding — the project name and logo shown
+/// across the sidebar, page title and login page. Editable by admins.
+/// User-authored prompt snippets appended to the quote EXTRACTION prompt.
+/// All enabled snippets are concatenated and sent alongside the built-in prompt
+/// when a quote is generated, so users can steer extraction without code changes.
+model QuotePrompt {
+  id        Int      @id @default(autoincrement())
+  name      String   @db.VarChar(150)
+  content   String   @db.Text
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("quote_prompts")
+}
+
+model AppSetting {
+  id        Int      @id @default(1)
+  appName   String   @default("Jobwork") @map("app_name") @db.VarChar(120)
+  /// Logo as a data URL (data:image/…;base64,…), or null for the letter mark.
+  logo      String?  @db.LongText
+  /// Accent-color preset key (e.g. "indigo", "emerald") applied app-wide.
+  themeColor String  @default("indigo") @map("theme_color") @db.VarChar(30)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("app_settings")
+}
+
+/// A password-reset request. Stores a bcrypt hash of the 6-digit OTP (never the
+/// OTP itself), with an expiry + attempt counter. Consumed once used.
+model PasswordReset {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @map("user_id")
+  otpHash   String   @map("otp_hash") @db.VarChar(255)
+  expiresAt DateTime @map("expires_at")
+  used      Boolean  @default(false)
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_resets")
+}
+
+/// Singleton (id = 1) holding the letter-pad (letterhead) DESIGN — the branded
+/// HTML shell every outgoing email is wrapped in. The page supplies the body
+/// content into the `{{content}}` slot; `{{title}}`, `{{company_name}}` and
+/// `{{date}}` are filled at send time. This is a design, not message content.
+model Letterhead {
+  id        Int      @id @default(1)
+  html      String?  @db.LongText
+  enabled   Boolean  @default(true)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("letterheads")
+}
+
+/// Singleton (id = 1) holding SMTP/email configuration for outgoing mail.
+/// Password is stored server-side and never returned to the client (masked).
+model SmtpSetting {
+  id          Int      @id @default(1)
+  host        String?  @db.VarChar(190)
+  port        Int      @default(587)
+  secure      Boolean  @default(false) // true = implicit TLS (465)
+  username    String?  @db.VarChar(190)
+  password    String?  @db.Text
+  fromName    String?  @map("from_name") @db.VarChar(120)
+  fromEmail   String?  @map("from_email") @db.VarChar(190)
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("smtp_settings")
+}
+
+/// Singleton (id = 1) holding the active LLM provider + credentials, editable
+/// by admins from Settings. Provider-neutral: works for OpenAI or Claude.
+model LlmSetting {
+  id              Int      @id @default(1)
+  provider        String   @default("stub") @db.VarChar(20)
+  openaiApiKey    String?  @map("openai_api_key") @db.Text
+  openaiModel     String   @default("gpt-4o") @map("openai_model") @db.VarChar(80)
+  anthropicApiKey String?  @map("anthropic_api_key") @db.Text
+  anthropicModel  String   @default("claude-opus-4-8") @map("anthropic_model") @db.VarChar(80)
+
+  // Manually-maintained credit balances. Providers don't expose remaining
+  // balance via the API key, so an admin sets these and usage is subtracted.
+  openaiBalance      Decimal?  @map("openai_balance") @db.Decimal(14, 2)
+  anthropicBalance   Decimal?  @map("anthropic_balance") @db.Decimal(14, 2)
+  balanceCurrency    String    @default("USD") @map("balance_currency") @db.VarChar(8)
+  // When each balance was last set — spend after this instant is subtracted.
+  openaiBalanceAt    DateTime? @map("openai_balance_at")
+  anthropicBalanceAt DateTime? @map("anthropic_balance_at")
+
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("llm_settings")
+}
+
+/// One metered LLM API call — tokens + computed USD cost. Summed to estimate
+/// spend against the admin-entered balance (providers expose no live balance).
+model LlmUsage {
+  id           Int      @id @default(autoincrement())
+  provider     String   @db.VarChar(40)
+  model        String   @db.VarChar(80)
+  feature      String?  @db.VarChar(60)
+  inputTokens  Int      @default(0) @map("input_tokens")
+  outputTokens Int      @default(0) @map("output_tokens")
+  costUsd      Decimal  @default(0) @map("cost_usd") @db.Decimal(12, 6)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([provider, createdAt])
+  @@map("llm_usage")
+}
+
+/// A customer. Only `name` is required; contact details are optional.
+/// Only ACTIVE customers are offered when generating a quote.
+model Customer {
+  id          Int      @id @default(autoincrement())
+  name        String   @db.VarChar(190)
+  status      CompanyStatus @default(ACTIVE)
+  email       String?  @db.VarChar(190)
+  phone       String?  @db.VarChar(40)
+  address     String?  @db.Text
+  createdById Int      @map("created_by_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  createdBy User              @relation(fields: [createdById], references: [id])
+  analyses  JobworkAnalysis[]
+  quotes    Quote[]
+
+  @@index([createdById])
+  @@index([name])
+  @@index([status])
+  @@map("customers")
+}
+
+/// A generated quote: input documents matched against a brand's price list,
+/// priced deterministically in code. Lines are reviewable/editable before the
+/// quote is finalised.
+model Quote {
+  id                  Int         @id @default(autoincrement())
+  title               String?     @db.VarChar(190)
+  status              QuoteStatus @default(PENDING)
+  customerId          Int         @map("customer_id")
+  categoryId          Int?        @map("category_id")
+  /// Brand whose price list drives matching (v1: a single brand, e.g. "LK").
+  brand               String?     @db.VarChar(80)
+  /// The ingested price-list document used as the candidate source.
+  priceListDocumentId Int?        @map("price_list_document_id")
+  /// Which LLM produced the draft — "openai" | "claude".
+  provider            String?     @db.VarChar(40)
+  summary             String?     @db.Text
+  error               String?     @db.Text
+  /// Feeder-grouped BOM (Board→Feeder→items) captured at generation for the
+  /// "Switchgear Report-Board" export; null for quotes generated before this.
+  bomJson             Json?       @map("bom_json")
+  /// Custom download file name set from the chat ("rename the file to …").
+  downloadName        String?     @map("download_name") @db.VarChar(190)
+  createdById         Int         @map("created_by_id")
+  createdAt           DateTime    @default(now()) @map("created_at")
+  updatedAt           DateTime    @updatedAt @map("updated_at")
+
+  customer        Customer         @relation(fields: [customerId], references: [id])
+  category        ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  priceListDocument ProductDocument? @relation(fields: [priceListDocumentId], references: [id], onDelete: SetNull)
+  createdBy       User             @relation(fields: [createdById], references: [id])
+  documents       QuoteDocument[]
+  lines           QuoteLine[]
+  messages        QuoteMessage[]
+  emailLogs       EmailLog[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([createdById])
+  @@index([createdAt])
+  @@map("quotes")
+}
+
+/// A message in a quote's follow-up chat thread (ask about the quote, refine
+/// it, etc.). Provider-neutral role/content, same shape as jobwork_messages.
+model QuoteMessage {
+  id        Int         @id @default(autoincrement())
+  quoteId   Int         @map("quote_id")
+  role      MessageRole
+  content   String      @db.Text
+  /// Files the user attached to this chat message: [{name, path, mimeType}].
+  attachments Json?
+  createdAt DateTime    @default(now()) @map("created_at")
+
+  quote Quote @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+
+  @@index([quoteId, createdAt])
+  @@map("quote_messages")
+}
+
+/// An uploaded input file (BOQ / spec / drawing) for a quote.
+model QuoteDocument {
+  id          Int      @id @default(autoincrement())
+  quoteId     Int      @map("quote_id")
+  fileName    String   @map("file_name") @db.VarChar(255)
+  storedName  String   @map("stored_name") @db.VarChar(255)
+  mimeType    String   @map("mime_type") @db.VarChar(120)
+  sizeBytes   Int      @map("size_bytes")
+  storagePath String   @map("storage_path") @db.VarChar(500)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  quote Quote @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+
+  @@index([quoteId])
+  @@map("quote_documents")
+}
+
+/// One priced line on a quote. Prices/amounts are computed in code from the
+/// matched price-list item + the per-quote discount — never by the model.
+model QuoteLine {
+  id           Int      @id @default(autoincrement())
+  quoteId      Int      @map("quote_id")
+  lineNo       Int      @map("line_no")
+  /// The requirement text this line answers (from the input BOQ).
+  requirement  String   @db.Text
+  /// Whether this line is a derived accessory rather than a primary item.
+  isAccessory  Boolean  @default(false) @map("is_accessory")
+
+  family       String?  @db.VarChar(160)
+  make         String?  @db.VarChar(80)
+  catalogNo    String?  @map("catalog_no") @db.VarChar(160)
+  description  String?  @db.Text
+  quantity     Int      @default(1)
+
+  listPrice    Decimal? @map("list_price") @db.Decimal(12, 2)
+  discountPct  Decimal  @default(0) @map("discount_pct") @db.Decimal(6, 2)
+  rate         Decimal? @db.Decimal(12, 2)
+  amount       Decimal? @db.Decimal(14, 2)
+
+  /// 0..1 model confidence in the match; low values are flagged for review.
+  confidence   Decimal? @db.Decimal(4, 3)
+  matchNote    String?  @map("match_note") @db.Text
+  priceListItemId Int?  @map("price_list_item_id")
+
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  quote Quote @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+
+  @@index([quoteId, lineNo])
+  @@map("quote_lines")
+}
+
+/// A company, maintained in its own module with an Active/Inactive status.
+model Company {
+  id          Int           @id @default(autoincrement())
+  name        String        @unique @db.VarChar(190)
+  status      CompanyStatus @default(ACTIVE)
+  email       String?       @db.VarChar(190)
+  phone       String?       @db.VarChar(40)
+  address     String?       @db.Text
+  description String?       @db.LongText
+  createdById Int           @map("created_by_id")
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  createdBy         User              @relation(fields: [createdById], references: [id])
+  categories        ProductCategory[] @relation("CategoryCompanies")
+  priceListDocuments ProductDocument[] @relation("CompanyPriceLists")
+  prompts           BrandPrompt[]
+
+  @@index([createdById])
+  @@index([status])
+  @@map("companies")
+}
+
+/// A brand's keyword prompt — free-text guidance about the brand's products
+/// (series names, trade shorthand, preferences). Every prompt with `train` on is
+/// sent to the model when a quote is generated for that brand.
+model BrandPrompt {
+  id        Int      @id @default(autoincrement())
+  companyId Int      @map("company_id")
+  /// Short label the user gives the prompt, e.g. "Rule 1".
+  name      String   @default("") @db.VarChar(150)
+  content   String   @db.LongText
+  train     Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, train])
+  @@map("brand_prompts")
+}
+
+/// A product category (e.g. "MCCB") and the brands it supports.
+/// `brands` is stored inline as a JSON array of names — no separate brand table.
+model ProductCategory {
+  id          Int      @id @default(autoincrement())
+  name        String   @unique @db.VarChar(190)
+  brands      Json // e.g. ["LK", "Siemens", "Schneider", "ABB"]
+  description String?  @db.Text
+  createdById Int      @map("created_by_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  createdBy    User                 @relation(fields: [createdById], references: [id])
+  // A category can be linked to many companies, and vice-versa.
+  companies      Company[]            @relation("CategoryCompanies")
+  requirements   JobworkRequirement[]
+  documents      ProductDocument[]
+  quoteAnalyses  JobworkAnalysis[]
+  priceListItems PriceListItem[]
+  quotes         Quote[]
+
+  @@index([createdById])
+  @@map("product_categories")
+}
+
+/// An uploaded document attached to a product category. The binary lives on
+/// disk; only metadata + the storage path are stored here.
+model ProductDocument {
+  id          Int          @id @default(autoincrement())
+  /// A document belongs to a category (spec/drawing) OR to a brand/company
+  /// (a price list). Price lists are brand-owned, so categoryId may be null.
+  categoryId  Int?         @map("category_id")
+  /// For a brand-owned PRICE_LIST: which brand (Company) it belongs to.
+  companyId   Int?         @map("company_id")
+  /// Short label the user gives the file, e.g. "Price list 1" (brand files).
+  name        String?      @db.VarChar(150)
+  fileName    String       @map("file_name") @db.VarChar(255)
+  storedName  String       @map("stored_name") @db.VarChar(255)
+  mimeType    String       @map("mime_type") @db.VarChar(120)
+  sizeBytes   Int          @map("size_bytes")
+  storagePath String       @map("storage_path") @db.VarChar(500)
+  /// What this document is. Only PRICE_LIST docs get ingested.
+  kind        DocumentKind @default(OTHER)
+  /// For PRICE_LIST docs: which brand's price list this is (e.g. "LK").
+  brand       String?      @db.VarChar(80)
+  /// Whether this file is trained (ingested) and used by Get Quote. An untrained
+  /// file is only stored with the brand; its rows are never matched against.
+  train       Boolean      @default(true)
+  createdById Int          @map("created_by_id")
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @default(now()) @updatedAt @map("updated_at")
+
+  // ----- Ingestion tracking (price lists only) -----
+  ingestStatus      IngestStatus @default(NOT_STARTED) @map("ingest_status")
+  ingestError       String?      @map("ingest_error") @db.Text
+  ingestedItemCount Int?         @map("ingested_item_count")
+  ingestedAt        DateTime?    @map("ingested_at")
+
+  // ----- Text extraction (every brand file, trained or not) -----
+  textStatus IngestStatus @default(NOT_STARTED) @map("text_status")
+  textError  String?      @map("text_error") @db.Text
+  /// Length of the extracted text; 0 = the file has no readable text at all.
+  textChars  Int?         @map("text_chars")
+  /// How the text was obtained: "FILE" = read straight from the file (free),
+  /// "AI" = a scan/image read by the AI provider (costs API credit).
+  textSource String?      @map("text_source") @db.VarChar(10)
+
+  category       ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  company        Company?         @relation("CompanyPriceLists", fields: [companyId], references: [id], onDelete: SetNull)
+  createdBy      User             @relation(fields: [createdById], references: [id])
+  priceListItems PriceListItem[]
+  textChunks     ProductDocumentText[]
+  quotes         Quote[]
+
+  @@index([categoryId])
+  @@index([companyId])
+  @@index([kind])
+  @@index([brand, kind, ingestStatus])
+  @@index([companyId, textStatus])
+  @@map("product_documents")
+}
+
+/// The plain text read out of an uploaded file, kept in order as chunks (`seq`).
+/// Chunked rather than one big value so a large catalogue never exceeds the
+/// database's per-row write limits; join the chunks in `seq` order to read it.
+model ProductDocumentText {
+  id         Int    @id @default(autoincrement())
+  documentId Int    @map("document_id")
+  seq        Int
+  text       String @db.MediumText
+
+  document ProductDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, seq])
+  @@map("product_document_texts")
+}
+
+/// One structured line parsed from a price-list PDF. This is the queryable
+/// catalogue: at quote time we retrieve a small set of these as match
+/// candidates instead of ever sending the whole PDF to the model.
+model PriceListItem {
+  id         Int    @id @default(autoincrement())
+  documentId Int    @map("document_id")
+  /// Optional: a price list is brand-owned, so its items need no category.
+  categoryId Int?   @map("category_id")
+  brand      String @db.VarChar(80)
+
+  /// Product family / series, e.g. "DN MCCB".
+  family String? @db.VarChar(160)
+  /// Type / model group, e.g. "DN0-100C".
+  type      String? @db.VarChar(160)
+  catalogNo String  @map("catalog_no") @db.VarChar(160)
+  /// Human-readable description assembled from the row (rating, poles, kA…).
+  description String @db.Text
+
+  // ----- Parsed technical attributes (nullable; used for retrieval filters) -----
+  poles        Int?
+  ratingAmp    Decimal? @map("rating_amp") @db.Decimal(10, 2)
+  ratingAmpMin Decimal? @map("rating_amp_min") @db.Decimal(10, 2)
+  ratingAmpMax Decimal? @map("rating_amp_max") @db.Decimal(10, 2)
+  breakingKa   Decimal? @map("breaking_ka") @db.Decimal(10, 2)
+
+  /// List price (M.R.P.) per unit, in INR.
+  listPrice Decimal @map("list_price") @db.Decimal(12, 2)
+  unit      String? @db.VarChar(40)
+
+  /// Provenance + a place for any extra parsed fields not modelled above.
+  pageNo     Int?    @map("page_no")
+  rawText    String? @map("raw_text") @db.Text
+  attributes Json?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  document ProductDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  category ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@index([categoryId, brand])
+  @@index([catalogNo])
+  @@index([brand, ratingAmp])
+  @@map("price_list_items")
+}
+
+/// One job-work analysis run: a customer + uploaded documents + the extracted
+/// requirements + the chat thread. The LLM provider (OpenAI or Claude) is
+/// pluggable — nothing here is provider-specific.
+model JobworkAnalysis {
+  id          Int            @id @default(autoincrement())
+  title       String?        @db.VarChar(190)
+  status      AnalysisStatus @default(PENDING)
+  summary     String?        @db.Text
+  /// Which LLM produced the result — e.g. "stub", "openai", "claude".
+  provider    String?        @db.VarChar(40)
+  error       String?        @db.Text
+  customerId  Int            @map("customer_id")
+  /// Selected product category for this quote (optional).
+  categoryId  Int?           @map("category_id")
+  /// Selected supported brands for this quote (JSON array of names).
+  brands      Json?
+  createdById Int            @map("created_by_id")
+  createdAt   DateTime       @default(now()) @map("created_at")
+  updatedAt   DateTime       @updatedAt @map("updated_at")
+
+  customer     Customer             @relation(fields: [customerId], references: [id])
+  category     ProductCategory?     @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  createdBy    User                 @relation(fields: [createdById], references: [id])
+  documents    JobworkDocument[]
+  messages     JobworkMessage[]
+  requirements JobworkRequirement[]
+
+  @@index([customerId])
+  @@index([categoryId])
+  @@index([createdById])
+  @@index([status])
+  @@map("jobwork_analyses")
+}
+
+/// An uploaded source document for an analysis. The binary lives on disk;
+/// only metadata + the storage path are stored here.
+model JobworkDocument {
+  id          Int      @id @default(autoincrement())
+  analysisId  Int      @map("analysis_id")
+  fileName    String   @map("file_name") @db.VarChar(255)
+  storedName  String   @map("stored_name") @db.VarChar(255)
+  mimeType    String   @map("mime_type") @db.VarChar(120)
+  sizeBytes   Int      @map("size_bytes")
+  storagePath String   @map("storage_path") @db.VarChar(500)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  analysis JobworkAnalysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+
+  @@index([analysisId])
+  @@map("jobwork_documents")
+}
+
+/// A message in the analysis chat thread. Provider-neutral role/content shape
+/// so the same rows map onto OpenAI or Claude message formats.
+model JobworkMessage {
+  id         Int         @id @default(autoincrement())
+  analysisId Int         @map("analysis_id")
+  role       MessageRole
+  content    String      @db.Text
+  createdAt  DateTime    @default(now()) @map("created_at")
+
+  analysis JobworkAnalysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+
+  @@index([analysisId])
+  @@map("jobwork_messages")
+}
+
+/// A part/requirement extracted from the documents, optionally matched to a
+/// product category, with suggested supplier brands stored inline as JSON.
+model JobworkRequirement {
+  id                Int      @id @default(autoincrement())
+  analysisId        Int      @map("analysis_id")
+  partName          String   @map("part_name") @db.VarChar(255)
+  quantity          Int?
+  specifications    String?  @db.Text
+  matchedCategoryId Int?     @map("matched_category_id")
+  suggestedBrands   Json     @map("suggested_brands") // e.g. ["Siemens", "ABB"]
+  notes             String?  @db.Text
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  analysis        JobworkAnalysis  @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  matchedCategory ProductCategory? @relation(fields: [matchedCategoryId], references: [id], onDelete: SetNull)
+
+  @@index([analysisId])
+  @@index([matchedCategoryId])
+  @@map("jobwork_requirements")
+}
+
+/// Audit record of one outbound email (new-user credentials or quote send).
+/// Stores the rendered subject/recipients so the history is self-contained.
+model EmailLog {
+  id         Int       @id @default(autoincrement())
+  quoteId    Int?      @map("quote_id")
+  toEmail    String    @map("to_email") @db.VarChar(190)
+  ccEmail    String?   @map("cc_email") @db.VarChar(400)
+  subject    String    @db.VarChar(300)
+  body       String    @db.Text
+  hasAttachment Boolean @default(false) @map("has_attachment")
+  status     String    @default("SENT") @db.VarChar(20) // SENT | FAILED
+  error      String?   @db.Text
+  sentById   Int?      @map("sent_by_id")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  quote    Quote?         @relation(fields: [quoteId], references: [id], onDelete: SetNull)
+  sentBy   User?          @relation(fields: [sentById], references: [id], onDelete: SetNull)
+
+  @@index([quoteId])
+  @@index([createdAt])
+  @@map("email_logs")
+}

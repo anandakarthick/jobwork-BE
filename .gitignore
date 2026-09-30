@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+*.log
+uploads/
+# database dumps in the project root hold API keys, SMTP settings and password hashes
+/*.sql
