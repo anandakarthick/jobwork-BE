@@ -4,6 +4,9 @@ import { prisma } from '../../lib/prisma';
 import { HttpError } from '../../lib/http-error';
 import { ingestDocument } from '../price-list/price-list.service';
 import { getDocumentText, startTextExtraction } from '../price-list/price-list.text';
+import { getEffectiveLlmConfig } from '../../lib/llm';
+import { forgetClaudeFile, forgetRuleFiles, startClaudeTraining, startRuleTraining } from './knowledge.service';
+// startClaudeTraining / startRuleTraining are used by the explicit Train endpoints below.
 import type {
   CreateCompanyInput,
   ListCompaniesQuery,
@@ -104,6 +107,13 @@ export function setStatus(id: number, status: 'ACTIVE' | 'INACTIVE') {
 }
 
 export async function deleteCompany(id: number) {
+  // Everything the brand trained into Claude goes with it — rules and files.
+  const [rules, docs] = await Promise.all([
+    prisma.brandPrompt.findMany({ where: { companyId: id }, select: { id: true } }),
+    prisma.productDocument.findMany({ where: { companyId: id }, select: { id: true } }),
+  ]);
+  await forgetRuleFiles(rules.map((r) => r.id)).catch(() => undefined);
+  for (const d of docs) await forgetClaudeFile(d.id).catch(() => undefined);
   await prisma.company.delete({ where: { id } });
 }
 
@@ -130,7 +140,19 @@ const priceListSelect = {
   textChars: true,
   textSource: true,
   textError: true,
+  aiFileId: true,
+  aiStatus: true,
+  aiError: true,
+  aiFileChars: true,
+  aiTrainedAt: true,
+  aiFileKind: true,
+  aiPages: true,
 } satisfies Prisma.ProductDocumentSelect;
+
+/** True when Get Quote runs on files trained into Claude (Settings → API Keys). */
+async function claudeEngine(): Promise<boolean> {
+  return (await getEffectiveLlmConfig()).quoteEngine === 'claude';
+}
 
 async function ensureCompany(id: number): Promise<{ id: number; name: string }> {
   const co = await prisma.company.findUnique({ where: { id }, select: { id: true, name: true } });
@@ -162,6 +184,7 @@ export async function addPriceLists(
 ) {
   const company = await ensureCompany(companyId);
   if (files.length === 0) throw HttpError.badRequest('No files uploaded');
+  const claude = await claudeEngine();
 
   for (const [i, f] of files.entries()) {
     const train = trainFlags[i] === true;
@@ -182,12 +205,25 @@ export async function addPriceLists(
       },
       select: { id: true },
     });
-    // Every file is read into text; only trained ones are also ingested.
+    if (claude) {
+      // Knowledge-in-Claude engine: nothing is parsed or stored in our tables, and
+      // nothing is sent to Claude until the user clicks Train on the file.
+      continue;
+    }
+    // Database engine: every file is read into text; trained ones are also ingested.
     await startTextExtraction(doc.id);
     if (train) await ingestDocument(doc.id);
   }
 
   return listPriceLists(companyId);
+}
+
+/** Train one brand file into Claude (upload its text to Anthropic's Files API). */
+export async function trainPriceListIntoClaude(companyId: number, docId: number) {
+  const doc = await prisma.productDocument.findFirst({ where: { id: docId, companyId } });
+  if (!doc) throw HttpError.notFound('Price list not found');
+  await startClaudeTraining(docId);
+  return prisma.productDocument.findUniqueOrThrow({ where: { id: docId }, select: priceListSelect });
 }
 
 /**
@@ -210,6 +246,12 @@ export async function updatePriceList(
       ...(input.train !== undefined ? { train: input.train } : {}),
     },
   });
+  if (await claudeEngine()) {
+    // Claude engine: saving changes nothing in Claude — training is the user's
+    // explicit Train click. Un-ticking Train removes the file from Claude.
+    if (input.train === false && doc.aiFileId) await forgetClaudeFile(docId).catch(() => undefined);
+    return prisma.productDocument.findUniqueOrThrow({ where: { id: docId }, select: priceListSelect });
+  }
   // A file whose text was never read (or failed) is read now, on any save.
   if (doc.textStatus === 'NOT_STARTED' || doc.textStatus === 'FAILED') {
     await startTextExtraction(docId);
@@ -229,7 +271,19 @@ const promptSelect = {
   train: true,
   createdAt: true,
   updatedAt: true,
+  aiFileId: true,
+  aiStatus: true,
+  aiError: true,
+  aiTrainedAt: true,
 } satisfies Prisma.BrandPromptSelect;
+
+/** Train one rule into Claude (upload its text to Anthropic's Files API). */
+export async function trainPromptIntoClaude(companyId: number, promptId: number) {
+  const rule = await prisma.brandPrompt.findFirst({ where: { id: promptId, companyId } });
+  if (!rule) throw HttpError.notFound('Rule not found');
+  await startRuleTraining(promptId);
+  return prisma.brandPrompt.findUniqueOrThrow({ where: { id: promptId }, select: promptSelect });
+}
 
 export async function listPrompts(companyId: number) {
   await ensureCompany(companyId);
@@ -253,12 +307,20 @@ export async function savePrompts(companyId: number, input: SavePromptsInput) {
 
   const ops: Prisma.PrismaPromise<unknown>[] = [];
   const removed = current.filter((p) => !keptIds.has(p.id)).map((p) => p.id);
-  if (removed.length) ops.push(prisma.brandPrompt.deleteMany({ where: { id: { in: removed } } }));
+  if (removed.length) {
+    await forgetRuleFiles(removed).catch(() => undefined); // their copies in Claude go too
+    ops.push(prisma.brandPrompt.deleteMany({ where: { id: { in: removed } } }));
+  }
 
+  // Rules whose TEXT changed (or are new) need training into Claude again — the
+  // file in Claude holds the old wording until then.
+  const changedText: number[] = [];
+  const created: { name: string }[] = [];
   for (const p of input.prompts) {
     const existing = p.id != null ? currentById.get(p.id) : undefined;
     if (p.id != null && !existing) throw HttpError.badRequest('Prompt does not belong to this brand');
     if (!existing) {
+      created.push({ name: p.name });
       ops.push(
         prisma.brandPrompt.create({
           data: { companyId, name: p.name, content: p.content, train: p.train },
@@ -269,27 +331,62 @@ export async function savePrompts(companyId: number, input: SavePromptsInput) {
       existing.content !== p.content ||
       existing.train !== p.train
     ) {
+      const textChanged = existing.content !== p.content || existing.name !== p.name;
+      if (textChanged) changedText.push(existing.id);
       ops.push(
         prisma.brandPrompt.update({
           where: { id: existing.id },
-          data: { name: p.name, content: p.content, train: p.train },
+          data: {
+            name: p.name,
+            content: p.content,
+            train: p.train,
+            // Stale in Claude until trained again.
+            ...(textChanged && existing.aiStatus !== 'NOT_STARTED' ? { aiStatus: 'NOT_STARTED' as const } : {}),
+          },
         }),
       );
     }
   }
 
   if (ops.length) await prisma.$transaction(ops);
+  // Claude engine: nothing is sent to Claude on save — a new or edited rule shows
+  // "not trained" until the user clicks Train (again). An untrained selected rule
+  // is still sent to a quote as text, so nothing is lost meanwhile.
+  void created;
+  void changedText;
   return listPrompts(companyId);
 }
 
 /**
- * The trained keyword prompts of the given brands, as one text block grouped by
- * brand — sent to the model when generating a quote. Empty when there are none.
+ * Every keyword prompt of the given brands (by name), for the rule picker on
+ * Get Quote: id, name, brand and whether it is trained (= ticked by default).
  */
-export async function getTrainedPromptText(brands: string[]): Promise<string> {
+export async function listPromptsForBrands(brands: string[]) {
+  if (brands.length === 0) return [];
+  const rows = await prisma.brandPrompt.findMany({
+    where: { company: { name: { in: brands } } },
+    select: { id: true, name: true, train: true, aiStatus: true, company: { select: { name: true } } },
+    orderBy: [{ companyId: 'asc' }, { id: 'asc' }],
+  });
+  return rows.map((r) => ({ id: r.id, name: r.name, train: r.train, aiStatus: r.aiStatus, brand: r.company.name }));
+}
+
+/**
+ * The keyword prompts of the given brands as one text block grouped by brand —
+ * sent to the model when generating a quote and on every chat turn. With
+ * `promptIds` only those prompts are used (the rules the user picked for the
+ * chat); otherwise every trained prompt. Empty when there are none.
+ */
+export async function getTrainedPromptText(
+  brands: string[],
+  promptIds: number[] | null = null,
+): Promise<string> {
   if (brands.length === 0) return '';
   const rows = await prisma.brandPrompt.findMany({
-    where: { train: true, company: { name: { in: brands } } },
+    where: {
+      company: { name: { in: brands } },
+      ...(promptIds ? { id: { in: promptIds } } : { train: true }),
+    },
     select: { name: true, content: true, company: { select: { name: true } } },
     orderBy: { id: 'asc' },
   });
@@ -325,6 +422,8 @@ export async function getPriceListText(companyId: number, docId: number) {
 export async function deletePriceList(companyId: number, docId: number) {
   const doc = await prisma.productDocument.findFirst({ where: { id: docId, companyId } });
   if (!doc) throw HttpError.notFound('Price list not found');
+  // Its copy in Claude goes too, so a deleted file is never read again.
+  await forgetClaudeFile(docId).catch(() => undefined);
   await prisma.productDocument.delete({ where: { id: docId } });
   await fs.rm(doc.storagePath, { force: true }).catch(() => {});
 }

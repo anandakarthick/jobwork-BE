@@ -2,9 +2,12 @@ import type { Prisma, PriceListItem } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { rankCandidates } from '../price-list/price-list.retrieval';
 import { HttpError } from '../../lib/http-error';
-import { getLlmProvider, type LlmMessage } from '../../lib/llm';
+import { getEffectiveLlmConfig, getLlmProvider, type LlmMessage } from '../../lib/llm';
+import { chatWithKnowledge, generateWithKnowledge, type KnowledgeResult } from './quote.knowledge';
+import { knowledgeRulesForQuote } from '../companies/knowledge.service';
 import { readInputs, type InputFile } from './quote.reader';
 import {
+  applyRuleAccessories,
   consolidateLines,
   deriveSeries,
   extractRequirements,
@@ -12,12 +15,12 @@ import {
   priceLines,
   retrieveCandidates,
 } from './quote.pipeline';
-import { getEnabledQuotePromptText } from '../settings/settings.service';
-import { getTrainedPromptText } from '../companies/company.service';
+import { getTrainedPromptText, listPromptsForBrands } from '../companies/company.service';
 import { retrieveReferenceSnippets } from '../price-list/price-list.text';
 import { buildQuoteWorkbook } from './quote.xlsx';
 import { buildBomWorkbook, groupIntoBom, type BomBoard, type BomFeeder, type BomItem } from './quote.bom';
-import type { CreateQuoteInput, ListQuotesQuery } from './quote.schema';
+import { clearProgress, getProgress, setProgress, type ProgressStage } from './quote.progress';
+import type { CreateQuoteInput, ListQuotesQuery, UpdateQuoteInput } from './quote.schema';
 
 /** Metadata for a stored upload, as produced by the multer middleware. */
 export interface StoredFile {
@@ -36,8 +39,28 @@ const detailInclude = {
   messages: { orderBy: { createdAt: 'asc' } },
 } satisfies Prisma.QuoteInclude;
 
-export function getQuote(id: number) {
-  return prisma.quote.findUniqueOrThrow({ where: { id }, include: detailInclude });
+/** The rule ids stored on a quote, or null when it uses every trained prompt. */
+function quotePromptIds(quote: { promptIds: Prisma.JsonValue | null }): number[] | null {
+  return Array.isArray(quote.promptIds)
+    ? quote.promptIds.filter((v): v is number => typeof v === 'number')
+    : null;
+}
+
+/** A quote with its chosen rules resolved to names, for the chat header. */
+export async function getQuote(id: number) {
+  const quote = await prisma.quote.findUniqueOrThrow({ where: { id }, include: detailInclude });
+  const ids = quotePromptIds(quote);
+  const rules = ids
+    ? await prisma.brandPrompt.findMany({
+        where: { id: { in: ids } },
+        select: { id: true, name: true, company: { select: { name: true } } },
+        orderBy: { id: 'asc' },
+      })
+    : [];
+  return {
+    ...quote,
+    rules: rules.map((r) => ({ id: r.id, name: r.name, brand: r.company.name })),
+  };
 }
 
 export async function listQuotes(query: ListQuotesQuery) {
@@ -100,9 +123,26 @@ function autoTitle(customer: string, files: StoredFile[]): string {
   return `${customer}${file ? ` — ${file}` : ''}`.slice(0, 190);
 }
 
-export async function renameQuote(id: number, title: string) {
-  await prisma.quote.findUniqueOrThrow({ where: { id }, select: { id: true } });
-  return prisma.quote.update({ where: { id }, data: { title }, include: detailInclude });
+/**
+ * Change a chat's name, customer, brands or selected rules. The new brands and
+ * rules apply to every later message and to the next regeneration; the lines
+ * already generated are left as they are until the user regenerates.
+ */
+export async function updateQuote(id: number, input: UpdateQuoteInput) {
+  if (input.customerId !== undefined) {
+    const customer = await prisma.customer.findUnique({ where: { id: input.customerId } });
+    if (!customer) throw HttpError.badRequest('Customer not found');
+  }
+  await prisma.quote.update({
+    where: { id },
+    data: {
+      ...(input.title !== undefined ? { title: input.title } : {}),
+      ...(input.customerId !== undefined ? { customerId: input.customerId } : {}),
+      ...(input.brand !== undefined ? { brand: input.brand } : {}),
+      ...(input.promptIds !== undefined ? { promptIds: input.promptIds } : {}),
+    },
+  });
+  return getQuote(id);
 }
 
 export async function createQuote(input: CreateQuoteInput, files: StoredFile[], userId: number) {
@@ -116,6 +156,7 @@ export async function createQuote(input: CreateQuoteInput, files: StoredFile[], 
     data: {
       title: input.title || autoTitle(customer.name, files),
       status: 'PROCESSING',
+      promptIds: input.promptIds ?? undefined,
       customerId: input.customerId,
       categoryId: input.categoryId ?? null,
       brand: input.brand ?? null,
@@ -147,10 +188,23 @@ export async function createQuote(input: CreateQuoteInput, files: StoredFile[], 
     },
   });
 
-  await processQuote(quote.id, input, files).catch(() => {
+  // Generation runs in the background: the client gets the PROCESSING quote at
+  // once and polls GET /quotes/:id/progress for the stage that is really running.
+  setProgress(quote.id, 'collect', 'Loading price lists, rules and reference text');
+  void processQuote(quote.id, input, files).catch(() => {
     /* processQuote records its own FAILED state */
   });
   return getQuote(quote.id);
+}
+
+/** Live generation progress plus the quote's status, for the client to poll. */
+export async function getQuoteProgress(id: number) {
+  const quote = await prisma.quote.findUnique({
+    where: { id },
+    select: { id: true, status: true, error: true },
+  });
+  if (!quote) throw HttpError.notFound('Quote not found');
+  return { status: quote.status, error: quote.error, progress: getProgress(id) };
 }
 
 /**
@@ -164,22 +218,47 @@ async function runQuotePipeline(opts: {
   brandLabel: string;
   categoryName: string;
   defaultDiscountPct: number;
-  extraInstructions: string;
-  /** The quoted brands' trained keyword prompts — steer extraction AND matching. */
+  /** What the customer typed with the BOQ — steers extraction and matching. */
+  customerNotes: string;
+  /** The brand rules (keyword prompts) picked for the chat — steer extraction and matching. */
   brandNotes: string;
+  /** The quoted brands, for the reference-file lookup during matching. */
+  brands: string[];
   pool: PriceListItem[];
+  /** Reports the stage that is running, for the live progress card. */
+  onProgress?: (stage: ProgressStage, detail?: string | null, fraction?: number) => void;
 }) {
-  const { provider, inputText, brandLabel, categoryName, defaultDiscountPct, extraInstructions, brandNotes, pool } = opts;
-  const requirements = await extractRequirements(
+  const { provider, inputText, brandLabel, categoryName, defaultDiscountPct, customerNotes, brandNotes, brands, pool } = opts;
+  const report = opts.onProgress ?? (() => undefined);
+  report('extract', `Reading ${Math.max(1, Math.round(inputText.length / 1000))}k characters of BOQ text`);
+  const extracted = await extractRequirements(
     provider,
     inputText,
     { brand: brandLabel, category: categoryName },
-    [extraInstructions, brandNotes && `BRAND KEYWORD NOTES:\n${brandNotes}`].filter(Boolean).join('\n\n'),
+    [
+      customerNotes && `CUSTOMER INSTRUCTIONS:\n${customerNotes}`,
+      brandNotes && `BRAND RULES:\n${brandNotes}`,
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
   );
+  // The brand rules decide the accessories (mandatory + conditional) per breaker.
+  report('extract', `${extracted.length} line(s) found — applying the brand rules for accessories`, 0.7);
+  const requirements = await applyRuleAccessories(provider, extracted, { brandNotes, customerNotes });
+  report('retrieve', `${requirements.length} line(s) found — shortlisting ${pool.length} price-list rows`);
   const candidates = retrieveCandidates(pool, requirements);
   const series = deriveSeries(candidates, requirements);
-  const matches = await matchRequirements(provider, requirements, candidates, series, brandNotes);
+  const matches = await matchRequirements(provider, requirements, candidates, series, {
+    brandNotes,
+    customerNotes,
+    // Passages of the brands' reference files about the lines in each batch.
+    retrieveReference: (query) => retrieveReferenceSnippets(brands, query, 4, 2500),
+    onBatch: (batch, total) =>
+      report('match', `Batch ${batch} of ${total} · ${requirements.length} line(s)`, (batch - 1) / total),
+  });
+  report('price', `Pricing ${requirements.length} line(s) and resolving accessories`);
   const pricedRaw = priceLines(requirements, matches, candidates, defaultDiscountPct, pool);
+  report('assemble', 'Grouping into boards and feeders');
   const priced = consolidateLines(pricedRaw);
   const bom = groupIntoBom(pricedRaw);
   const matchedCount = priced.filter((l) => l.catalogNo).length;
@@ -208,6 +287,66 @@ function quoteLineRows(quoteId: number, priced: Awaited<ReturnType<typeof runQuo
   }));
 }
 
+/** quote_lines rows for a knowledge-engine result (flat, verified lines). */
+function knowledgeLineRows(quoteId: number, lines: KnowledgeResult['lines']) {
+  return lines.map((l) => ({
+    quoteId,
+    lineNo: l.lineNo,
+    requirement: l.requirement,
+    isAccessory: l.isAccessory,
+    family: l.family,
+    make: l.make,
+    catalogNo: l.catalogNo,
+    description: l.description,
+    quantity: l.quantity,
+    listPrice: l.listPrice,
+    discountPct: l.discountPct,
+    rate: l.rate,
+    amount: l.amount,
+    confidence: l.confidence,
+    matchNote: l.matchNote,
+    priceListItemId: null,
+  }));
+}
+
+/** Persist a knowledge-engine BOM (generation or a chat change) on the quote. */
+async function saveKnowledgeResult(quoteId: number, provider: string, result: KnowledgeResult, assistantMessage: string) {
+  await prisma.$transaction([
+    prisma.quoteLine.deleteMany({ where: { quoteId } }),
+    prisma.quoteLine.createMany({ data: knowledgeLineRows(quoteId, result.lines) }),
+    prisma.quoteMessage.create({ data: { quoteId, role: 'ASSISTANT', content: assistantMessage } }),
+    prisma.quote.update({
+      where: { id: quoteId },
+      data: {
+        status: 'COMPLETED',
+        provider,
+        error: null,
+        summary: `Matched ${result.matched}/${result.total} lines.`,
+        bomJson: result.boards as unknown as Prisma.InputJsonValue,
+      },
+    }),
+  ]);
+}
+
+/** The reply that opens / follows a knowledge-engine generation. */
+function knowledgeReply(result: KnowledgeResult, brands: string[], ruleNames: string[], lead: string): string {
+  const review = result.total - result.matched;
+  return (
+    `${lead} (${brands.join(', ') || 'brand'}). ` +
+    `${result.matched} of ${result.total} line(s) priced from the brand files` +
+    (review ? `, ${review} flagged for review.` : '.') +
+    (result.summary ? `\n\n${result.summary}` : '') +
+    (result.voided.length
+      ? `\n\nNot confirmed in the price list (cleared, please verify): ${result.voided.slice(0, 12).join('; ')}` +
+        (result.voided.length > 12 ? ` … and ${result.voided.length - 12} more.` : '.')
+      : '') +
+    `\n\nApplied: ` +
+    (ruleNames.length ? `rules ${ruleNames.join(', ')}` : 'no brand rules') +
+    `; brand files trained into Claude.` +
+    `\n\nAsk me to adjust quantities, swap a part, or explain any line.`
+  );
+}
+
 /** Run the extract → retrieve → match → price pipeline and persist the lines. */
 async function processQuote(quoteId: number, input: CreateQuoteInput, files: StoredFile[]) {
   try {
@@ -216,6 +355,36 @@ async function processQuote(quoteId: number, input: CreateQuoteInput, files: Sto
       throw HttpError.badRequest(
         'No AI provider is configured. Add an OpenAI or Claude API key in Settings → API Keys.',
       );
+    }
+
+    // ── Engine "claude": the brand files live in Claude; one request → the BOM.
+    if ((await getEffectiveLlmConfig()).quoteEngine === 'claude') {
+      const brands = parseBrands(input.brand);
+      const promptIds = input.promptIds ?? null;
+      setProgress(quoteId, 'read', `Reading ${files.map((f) => f.originalName).join(', ')}`);
+      const boqText = await readInputs(
+        files.map((f) => ({ fileName: f.originalName, mimeType: f.mimeType, path: f.path })),
+      );
+      const customer = await prisma.customer.findUnique({ where: { id: input.customerId }, select: { name: true } });
+      // The selected rules: trained ones by file id, untrained ones as text.
+      const rules = await knowledgeRulesForQuote(brands, promptIds);
+      const result = await generateWithKnowledge({
+        provider,
+        brands,
+        ruleFileIds: rules.fileIds,
+        rulesText: rules.inlineText,
+        customerNotes: input.message ?? '',
+        boqText,
+        customerName: customer?.name ?? '',
+        defaultDiscountPct: input.defaultDiscountPct ?? 0,
+        onProgress: (stage, detail) => setProgress(quoteId, stage, detail),
+      });
+      const ruleNames = (await listPromptsForBrands(brands))
+        .filter((p) => (promptIds ? promptIds.includes(p.id) : p.train))
+        .map((p) => `${p.brand} · ${p.name || `Rule ${p.id}`}`);
+      setProgress(quoteId, 'save', `Saving ${result.lines.length} line(s) and the BOM`);
+      await saveKnowledgeResult(quoteId, provider.name, result, knowledgeReply(result, brands, ruleNames, "Here's your draft quote"));
+      return;
     }
 
     const priceListDocumentIds = await resolvePriceListDocumentIds(input);
@@ -233,37 +402,52 @@ async function processQuote(quoteId: number, input: CreateQuoteInput, files: Sto
       mimeType: f.mimeType,
       path: f.path,
     }));
-    const brandLabel = parseBrands(input.brand).join(', ');
+    const brands = parseBrands(input.brand);
+    const brandLabel = brands.join(', ');
+    setProgress(quoteId, 'read', `Reading ${files.map((f) => f.originalName).join(', ')}`);
     const inputText = await readInputs(inputFiles);
-    // User-authored prompt snippets (Settings → Configure Prompt) are appended to
-    // the built-in extraction prompt so users can steer extraction per their
-    // needs — as is whatever the user typed when sending the BOQ.
-    const extraInstructions = [await getEnabledQuotePromptText(), input.message]
-      .filter(Boolean)
-      .join('\n\n');
+    const promptIds = input.promptIds ?? null;
 
     // Merge the pools of every selected brand's price list into one candidate set.
     const pool = await prisma.priceListItem.findMany({
       where: { documentId: { in: priceListDocumentIds } },
     });
     const { priced, bom, matchedCount, total } = await runQuotePipeline({
+      onProgress: (stage, detail, fraction) => setProgress(quoteId, stage, detail, fraction),
       provider,
       inputText,
       brandLabel,
       categoryName: category?.name ?? '',
       defaultDiscountPct: input.defaultDiscountPct ?? 0,
-      extraInstructions,
-      brandNotes: await getTrainedPromptText(parseBrands(input.brand)),
+      customerNotes: input.message,
+      brandNotes: await getTrainedPromptText(brands, promptIds),
+      brands,
       pool,
     });
 
+    // Tell the user exactly what shaped this draft, so they can see their rules
+    // and instructions were applied (and which reference files were available).
+    const ruleNames = (await listPromptsForBrands(brands))
+      .filter((p) => (promptIds ? promptIds.includes(p.id) : p.train))
+      .map((p) => `${p.brand} · ${p.name || `Rule ${p.id}`}`);
+    const refFiles = await prisma.productDocument.findMany({
+      where: { company: { name: { in: brands } }, textStatus: 'COMPLETED', textChars: { gt: 0 } },
+      select: { name: true, fileName: true },
+    });
     const reviewCount = total - matchedCount;
     const openingMessage =
       `Here's your draft quote (${brandLabel || 'brand'}). ` +
       `I matched ${matchedCount} of ${total} line(s)` +
       (reviewCount ? `, with ${reviewCount} flagged for review.` : '.') +
-      ` Ask me to adjust quantities, swap a part, or explain any line.`;
+      `\n\nApplied: ` +
+      (ruleNames.length ? `rules ${ruleNames.join(', ')}` : 'no brand rules') +
+      (input.message ? '; your instructions' : '') +
+      (refFiles.length
+        ? `; reference files ${refFiles.map((f) => f.name || f.fileName).join(', ')}`
+        : '') +
+      `.\n\nAsk me to adjust quantities, swap a part, or explain any line.`;
 
+    setProgress(quoteId, 'save', `Saving ${priced.length} line(s) and the BOM`);
     await prisma.$transaction([
       prisma.quoteLine.deleteMany({ where: { quoteId } }),
       prisma.quoteLine.createMany({ data: quoteLineRows(quoteId, priced) }),
@@ -288,6 +472,8 @@ async function processQuote(quoteId: number, input: CreateQuoteInput, files: Sto
       data: { status: 'FAILED', error: message.slice(0, 2000) },
     });
     throw err;
+  } finally {
+    clearProgress(quoteId);
   }
 }
 
@@ -314,11 +500,17 @@ export async function buildQuoteXlsx(id: number): Promise<{ buffer: Buffer; file
     include: {
       customer: { select: { name: true } },
       category: { select: { name: true } },
+      documents: { orderBy: { id: 'asc' }, take: 1, select: { fileName: true } },
       lines: { orderBy: { lineNo: 'asc' } },
     },
   });
   if (!quote) throw HttpError.notFound('Quote not found');
 
+  // Every chat gets its OWN file name: customer + the BOQ it was made from (or the
+  // product category) + date + the quote number — so two quotes for the same
+  // customer on the same day never share a name and never replace each other.
+  const boqName = quote.documents[0]?.fileName.replace(/\.[^.]+$/, '') ?? null;
+  const baseName = `${quoteFileBaseName(quote.customer.name, quote.category?.name ?? boqName, quote.createdAt)}-Q${quote.id}`;
   // A name set from the chat ("rename the file to …") overrides the derived one.
   const nameFor = (fallback: string) => `${quote.downloadName?.trim() || fallback}.xlsx`;
 
@@ -326,6 +518,12 @@ export async function buildQuoteXlsx(id: number): Promise<{ buffer: Buffer; file
   // at generation. Header fields are auto-filled from the quote/customer.
   const boards = (quote.bomJson as unknown as BomBoard[] | null) ?? null;
   if (boards && Array.isArray(boards) && boards.length) {
+    // Older quotes stored the feeder role on every item ("… — Incoming"); the role
+    // belongs on the feeder header only, so strip it from item rows at export.
+    for (const b of boards)
+      for (const f of b.feeders ?? [])
+        for (const it of f.items ?? [])
+          it.description = (it.description ?? '').replace(/\s*(?:—|,|-)\s*(?:Incoming|Outgoing)\s*$/i, '');
     const when = quote.createdAt;
     const dd = String(when.getDate()).padStart(2, '0');
     const mm = String(when.getMonth() + 1).padStart(2, '0');
@@ -338,8 +536,7 @@ export async function buildQuoteXlsx(id: number): Promise<{ buffer: Buffer; file
       },
       boards,
     );
-    const fileName = nameFor(quoteFileBaseName(quote.customer.name, quote.category?.name ?? null, when));
-    return { buffer, fileName };
+    return { buffer, fileName: nameFor(baseName) };
   }
 
   // The line's product Type (e.g. DN3-630N) lives on the linked price-list item,
@@ -396,10 +593,7 @@ export async function buildQuoteXlsx(id: number): Promise<{ buffer: Buffer; file
       priceListItemId: l.priceListItemId ?? null,
     })),
   );
-  const fileName = nameFor(
-    quoteFileBaseName(quote.customer.name, quote.category?.name ?? null, quote.createdAt),
-  );
-  return { buffer, fileName };
+  return { buffer, fileName: nameFor(baseName) };
 }
 
 /**
@@ -804,6 +998,7 @@ export async function addQuoteMessage(
     include: {
       customer: { select: { name: true } },
       category: { select: { name: true } },
+      documents: { orderBy: { id: 'asc' } },
       lines: { orderBy: { lineNo: 'asc' } },
       messages: { orderBy: { createdAt: 'asc' } },
     },
@@ -821,6 +1016,91 @@ export async function addQuoteMessage(
 
   const provider = await getLlmProvider();
 
+  // ── Engine "claude": the brand files are attached to every turn. A new BOQ or
+  // "regenerate" produces a fresh BOM; anything else is a question or a change
+  // that Claude answers with the complete updated BOM (verified before saving).
+  if ((await getEffectiveLlmConfig()).quoteEngine === 'claude' && provider.name !== 'stub') {
+    const brands = parseBrands(quote.brand);
+    const rules = await knowledgeRulesForQuote(brands, quotePromptIds(quote));
+    const ruleNames = (await listPromptsForBrands(brands))
+      .filter((p) => {
+        const ids = quotePromptIds(quote);
+        return ids ? ids.includes(p.id) : p.train;
+      })
+      .map((p) => `${p.brand} · ${p.name || `Rule ${p.id}`}`);
+    const wantsRegen = /\b(re-?generate|re-?run|re-?build|redo|generate again|run again|new output)\b/i.test(content);
+    const sources: ChatAttachment[] = attachments.length
+      ? attachments
+      : wantsRegen
+        ? quote.documents.map((d) => ({ name: d.fileName, path: d.storagePath, mimeType: d.mimeType }))
+        : [];
+    try {
+      if (sources.length) {
+        setProgress(quoteId, 'read', `Reading ${sources.map((a) => a.name).join(', ')}`);
+        const boqText = await readInputs(sources.map((a) => ({ fileName: a.name, mimeType: a.mimeType, path: a.path })));
+        const result = await generateWithKnowledge({
+          provider,
+          brands,
+          ruleFileIds: rules.fileIds,
+          rulesText: rules.inlineText,
+          customerNotes: content.trim(),
+          boqText,
+          customerName: quote.customer.name,
+          defaultDiscountPct: 0,
+          onProgress: (stage, detail) => setProgress(quoteId, stage, detail),
+        });
+        setProgress(quoteId, 'save', `Saving ${result.lines.length} line(s) and the BOM`);
+        const reply = knowledgeReply(result, brands, ruleNames, `Regenerated the quote from ${sources.map((a) => a.name).join(', ')}`);
+        await saveKnowledgeResult(quoteId, provider.name, result, reply);
+        const assistant = await prisma.quoteMessage.findFirstOrThrow({
+          where: { quoteId, role: 'ASSISTANT' },
+          orderBy: { createdAt: 'desc' },
+        });
+        return { ...assistant, quoteChanged: true };
+      }
+
+      setProgress(quoteId, 'extract', 'Claude is reading the brand files and your message');
+      const chat = await chatWithKnowledge({
+        provider,
+        brands,
+        ruleFileIds: rules.fileIds,
+        rulesText: rules.inlineText,
+        customerName: quote.customer.name,
+        currentBoards: (quote.bomJson as unknown as BomBoard[] | null) ?? null,
+        history: quote.messages.map((m) => ({ role: m.role.toLowerCase() as LlmMessage['role'], content: m.content })),
+        message: content || (attachments.length ? '(see attached files)' : ''),
+        defaultDiscountPct: 0,
+      });
+      let changed = false;
+      const dl = chat.fileName ? safeName(chat.fileName) : null;
+      if (dl) {
+        await prisma.quote.update({ where: { id: quoteId }, data: { downloadName: dl } });
+        changed = true;
+      }
+      if (chat.result) {
+        setProgress(quoteId, 'save', `Saving ${chat.result.lines.length} line(s) and the BOM`);
+        const reply =
+          (chat.reply || 'Updated the quote.') +
+          (chat.result.voided.length
+            ? `\n\nNot confirmed in the price list (cleared, please verify): ${chat.result.voided.slice(0, 12).join('; ')}.`
+            : '') +
+          ' The updated Excel is ready to download.';
+        await saveKnowledgeResult(quoteId, provider.name, chat.result, reply);
+        const assistant = await prisma.quoteMessage.findFirstOrThrow({
+          where: { quoteId, role: 'ASSISTANT' },
+          orderBy: { createdAt: 'desc' },
+        });
+        return { ...assistant, quoteChanged: true };
+      }
+      const assistant = await prisma.quoteMessage.create({
+        data: { quoteId, role: 'ASSISTANT', content: chat.reply || 'Okay.' },
+      });
+      return { ...assistant, quoteChanged: changed };
+    } finally {
+      clearProgress(quoteId);
+    }
+  }
+
   // ── Chat-driven REGENERATION ────────────────────────────────────────────────
   // If the user attached file(s) in the chat, treat them as a new/updated BOQ and
   // re-run the FULL generation pipeline (extract → retrieve → match → price →
@@ -828,23 +1108,43 @@ export async function addQuoteMessage(
   // passed as extra steering, so "regenerate from this, only the DZ series" or
   // "target the 630A feeder" is honored during extraction. The chat history is
   // kept (unlike first generation, which clears it).
-  if (attachments.length && provider.name !== 'stub') {
-    const inputFiles = attachments.map((a) => ({ fileName: a.name, mimeType: a.mimeType, path: a.path }));
-    const inputText = await readInputs(inputFiles);
+  //
+  // Asking to regenerate WITHOUT a file re-runs it on the quote's own BOQ, with
+  // whatever brands and rules the chat has NOW — the way to get a fresh output
+  // after changing the rule or brand selection.
+  const wantsRegenerate = /\b(re-?generate|re-?run|re-?build|redo|generate again|run again|new output)\b/i.test(content);
+  const sources: ChatAttachment[] = attachments.length
+    ? attachments
+    : wantsRegenerate
+      ? quote.documents.map((d) => ({ name: d.fileName, path: d.storagePath, mimeType: d.mimeType }))
+      : [];
+  if (sources.length && provider.name !== 'stub') {
+    // The chat request stays synchronous, but the live progress is published so
+    // the client can poll it while it waits for the reply.
+    setProgress(quoteId, 'read', `Reading ${sources.map((a) => a.name).join(', ')}`);
+    const inputFiles = sources.map((a) => ({ fileName: a.name, mimeType: a.mimeType, path: a.path }));
+    const inputText = await readInputs(inputFiles).finally(() => clearProgress(quoteId));
     const looksReadable = inputText.replace(/=====.*?=====/g, '').replace(/\[could not read[^\]]*\]/g, '').trim();
     if (looksReadable.length > 20) {
+      setProgress(quoteId, 'collect', 'Loading price lists, rules and reference text');
       const pool = await loadBrandPool(quote.brand);
-      const steer = [await getEnabledQuotePromptText(), content.trim()].filter(Boolean).join('\n');
+      const steer = content.trim();
       const { priced, bom, matchedCount, total } = await runQuotePipeline({
+        onProgress: (stage, detail, fraction) => setProgress(quoteId, stage, detail, fraction),
         provider,
         inputText,
         brandLabel: quote.brand ?? '',
         categoryName: quote.category?.name ?? '',
         defaultDiscountPct: 0,
-        extraInstructions: steer,
-        brandNotes: await getTrainedPromptText(parseBrands(quote.brand)),
+        customerNotes: steer,
+        brandNotes: await getTrainedPromptText(parseBrands(quote.brand), quotePromptIds(quote)),
+        brands: parseBrands(quote.brand),
         pool,
+      }).catch((err) => {
+        clearProgress(quoteId);
+        throw err;
       });
+      setProgress(quoteId, 'save', `Saving ${priced.length} line(s) and the BOM`);
       await prisma.$transaction([
         prisma.quoteLine.deleteMany({ where: { quoteId } }),
         prisma.quoteLine.createMany({ data: quoteLineRows(quoteId, priced) }),
@@ -857,19 +1157,43 @@ export async function addQuoteMessage(
             bomJson: bom as unknown as Prisma.InputJsonValue,
           },
         }),
-      ]);
+      ]).finally(() => clearProgress(quoteId));
       const feederCount = bom.reduce((n, b) => n + b.feeders.length, 0);
       const itemCount = bom.reduce((n, b) => n + b.feeders.reduce((m, f) => m + f.items.length, 0), 0);
+      const brands = parseBrands(quote.brand);
+      const ruleNames = (await listPromptsForBrands(brands))
+        .filter((p) => {
+          const ids = quotePromptIds(quote);
+          return ids ? ids.includes(p.id) : p.train;
+        })
+        .map((p) => `${p.brand} · ${p.name || `Rule ${p.id}`}`);
       const reply =
-        `Regenerated the quote from ${attachments.map((a) => a.name).join(', ')}` +
-        (content.trim() ? ` (${content.trim()})` : '') +
-        ` — ${feederCount} feeder(s), ${itemCount} item(s), matched ${matchedCount}/${total} line(s). ` +
-        `The updated Excel is ready to download.`;
+        `Regenerated the quote from ${sources.map((a) => a.name).join(', ')}` +
+        (attachments.length === 0 && content.trim() ? ` (${content.trim()})` : '') +
+        ` — ${feederCount} feeder(s), ${itemCount} item(s), matched ${matchedCount}/${total} line(s).` +
+        `\n\nApplied: brands ${brands.join(', ') || '—'}; ` +
+        (ruleNames.length ? `rules ${ruleNames.join(', ')}` : 'no brand rules') +
+        `. The updated Excel is ready to download.`;
       const assistant = await prisma.quoteMessage.create({
         data: { quoteId, role: 'ASSISTANT', content: reply },
       });
       return { ...assistant, quoteChanged: true };
     }
+
+    // Files were attached but nothing readable came out of them — say so plainly
+    // (naming each file's problem) instead of letting the chat guess.
+    const problems = [...inputText.matchAll(/\[could not read ([^:]+): ([^\]]*)\]/g)].map(
+      (m) => `${m[1]} — ${m[2]}`,
+    );
+    const reply =
+      `I couldn't read any text from ${sources.map((a) => a.name).join(', ')}` +
+      (problems.length ? ` (${problems.join('; ')})` : '') +
+      '. I can read PDF, Excel/CSV, Word and text files directly, and photos or scanned PDFs with the AI. ' +
+      'Please check the file and attach it again.';
+    const assistant = await prisma.quoteMessage.create({
+      data: { quoteId, role: 'ASSISTANT', content: reply },
+    });
+    return { ...assistant, quoteChanged: false };
   }
 
   const linesText = quote.lines
@@ -887,7 +1211,7 @@ export async function addQuoteMessage(
   // (rules) and the passages of its reference files that match this message.
   const brands = parseBrands(quote.brand);
   const [brandNotes, snippets] = await Promise.all([
-    getTrainedPromptText(brands),
+    getTrainedPromptText(brands, quotePromptIds(quote)),
     retrieveReferenceSnippets(brands, content),
   ]);
   const knowledge =

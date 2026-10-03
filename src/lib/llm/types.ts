@@ -96,6 +96,20 @@ export interface LlmProvider {
    * (JSON when `opts.json` is set).
    */
   completeParts(parts: LlmContentPart[], opts?: CompleteOptions): Promise<string>;
+  /**
+   * Knowledge completion: the brand's files (already stored with the provider,
+   * referenced by id) are attached to the conversation and the model answers
+   * from them. Only providers with a file store implement it (Claude).
+   */
+  completeWithKnowledge?(input: KnowledgeInput, opts?: CompleteOptions): Promise<string>;
+}
+
+/** A knowledge completion: provider-stored files + a conversation. */
+export interface KnowledgeInput {
+  /** Provider file ids (Anthropic Files API) attached to the FIRST user turn. */
+  fileIds: string[];
+  /** Conversation; the first user turn carries the files, the rest follow. */
+  messages: LlmMessage[];
 }
 
 /** Thrown when a selected provider is missing its API key / config. */

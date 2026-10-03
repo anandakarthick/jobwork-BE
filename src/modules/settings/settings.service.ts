@@ -125,6 +125,8 @@ export async function getLlmSettings() {
     provider: row?.provider ?? 'stub',
     openaiModel: row?.openaiModel ?? 'gpt-4o',
     anthropicModel: row?.anthropicModel ?? 'claude-opus-4-8',
+    quoteEngine: (row?.quoteEngine as 'database' | 'claude' | undefined) ?? 'database',
+    anthropicWorkspaceId: row?.anthropicWorkspaceId ?? '',
     openaiKeySet: Boolean(row?.openaiApiKey),
     anthropicKeySet: Boolean(row?.anthropicApiKey),
     openaiBalance: row?.openaiBalance != null ? Number(row.openaiBalance) : null,
@@ -160,6 +162,7 @@ export async function getLlmStatus() {
   return {
     provider,
     model,
+    quoteEngine: s.quoteEngine,
     keySet,
     balance,
     spent,
@@ -178,6 +181,8 @@ export async function updateLlmSettings(input: UpdateLlmInput) {
   const update: Prisma.LlmSettingUpdateInput = { provider: input.provider };
   if (input.openaiModel !== undefined) update.openaiModel = input.openaiModel;
   if (input.anthropicModel !== undefined) update.anthropicModel = input.anthropicModel;
+  if (input.quoteEngine !== undefined) update.quoteEngine = input.quoteEngine;
+  if (input.anthropicWorkspaceId !== undefined) update.anthropicWorkspaceId = input.anthropicWorkspaceId || null;
   // Setting a balance resets its "as of" instant, so spend is counted from now.
   if (input.openaiBalance !== undefined) {
     update.openaiBalance = input.openaiBalance;
@@ -203,6 +208,8 @@ export async function updateLlmSettings(input: UpdateLlmInput) {
       provider: input.provider,
       openaiModel: input.openaiModel ?? 'gpt-4o',
       anthropicModel: input.anthropicModel ?? 'claude-opus-4-8',
+      quoteEngine: input.quoteEngine ?? 'database',
+      anthropicWorkspaceId: input.anthropicWorkspaceId || null,
       openaiApiKey: input.clearOpenaiKey ? null : input.openaiApiKey || null,
       anthropicApiKey: input.clearAnthropicKey ? null : input.anthropicApiKey || null,
     },
@@ -211,43 +218,3 @@ export async function updateLlmSettings(input: UpdateLlmInput) {
   return getLlmSettings();
 }
 
-// ---------- Quote prompt snippets ----------
-import type { CreateQuotePromptInput, UpdateQuotePromptInput } from './settings.schema';
-
-/** All saved prompt snippets (newest last), for the Settings editor. */
-export function listQuotePrompts() {
-  return prisma.quotePrompt.findMany({ orderBy: { id: 'asc' } });
-}
-
-export function createQuotePrompt(input: CreateQuotePromptInput) {
-  return prisma.quotePrompt.create({
-    data: { name: input.name, content: input.content, enabled: input.enabled ?? true },
-  });
-}
-
-export function updateQuotePrompt(id: number, input: UpdateQuotePromptInput) {
-  return prisma.quotePrompt.update({
-    where: { id },
-    data: {
-      ...(input.name !== undefined ? { name: input.name } : {}),
-      ...(input.content !== undefined ? { content: input.content } : {}),
-      ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
-    },
-  });
-}
-
-export async function deleteQuotePrompt(id: number) {
-  await prisma.quotePrompt.delete({ where: { id } });
-}
-
-/**
- * Concatenated text of every ENABLED custom prompt — appended to the built-in
- * extraction prompt when a quote is generated. Empty string when none enabled.
- */
-export async function getEnabledQuotePromptText(): Promise<string> {
-  const rows = await prisma.quotePrompt.findMany({
-    where: { enabled: true },
-    orderBy: { id: 'asc' },
-  });
-  return rows.map((r) => r.content.trim()).filter(Boolean).join('\n\n');
-}

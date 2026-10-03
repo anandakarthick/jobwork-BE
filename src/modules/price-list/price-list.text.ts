@@ -127,6 +127,105 @@ async function readTextWithAI(provider: LlmProvider, src: DocSource): Promise<st
 }
 
 /**
+ * Complete PDF text via the bundled Python script (scripts/pdf_text.py): the text
+ * layer of every page plus LOCAL OCR (RapidOCR) of picture-only pages and of the
+ * images embedded on text pages — so a price list's graphic tables are trained
+ * too, at no API cost. Returns null when Python / the libraries are unavailable
+ * or the script fails, so callers can fall back to the plain text layer.
+ */
+export async function readPdfTextWithOcr(
+  src: DocSource,
+): Promise<{ text: string; pages: number; ocrPages: number; ocrImages: number } | null> {
+  if (!isPdf(src.mimeType, src.fileName)) return null;
+  const { spawn } = await import('child_process');
+  const os = await import('os');
+  const pathMod = await import('path');
+  const script = pathMod.resolve(process.cwd(), 'scripts', 'pdf_text.py');
+  const out = pathMod.join(os.tmpdir(), `jobwork-pdf-text-${process.pid}-${Date.now()}.txt`);
+  const python = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'py' : 'python3');
+  const args = [...(python === 'py' ? ['-3'] : []), script, src.path, out];
+
+  const summary = await new Promise<string | null>((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    const child = spawn(python, args, { windowsHide: true });
+    child.stdout.on('data', (d) => (stdout += String(d)));
+    child.stderr.on('data', (d) => (stderr += String(d)));
+    child.on('error', () => resolve(null));
+    child.on('close', (code) => {
+      if (code !== 0) {
+        console.warn('[pdf_text.py] failed:', stderr.trim().split('\n').slice(-3).join(' | '));
+        resolve(null);
+      } else resolve(stdout.trim().split('\n').pop() ?? null);
+    });
+  });
+  if (!summary) return null;
+  try {
+    const stats = JSON.parse(summary) as { pages: number; ocrPages: number; ocrImages: number };
+    const text = (await fs.readFile(out, 'utf8')).trim();
+    await fs.rm(out, { force: true }).catch(() => undefined);
+    if (!text) return null;
+    return { text, pages: stats.pages, ocrPages: stats.ocrPages, ocrImages: stats.ocrImages };
+  } catch {
+    await fs.rm(out, { force: true }).catch(() => undefined);
+    return null;
+  }
+}
+
+/** Minimum characters for a PDF page to count as having a text layer. */
+const BLANK_PAGE_CHARS = 40;
+
+/**
+ * Complete text of a PDF for training: the text layer, plus — for pages that
+ * have none (picture-only pages, scanned tables) — the AI's transcription of
+ * that page, so a mostly-text catalogue still contributes its image pages.
+ * Non-PDFs and PDFs with a text layer on every page are returned as read.
+ * `ocrPages` = how many pages the AI read (each one is a paid request).
+ */
+export async function readDocumentTextComplete(
+  src: DocSource,
+): Promise<{ text: string; source: 'FILE' | 'AI' | 'MIXED'; ocrPages: number }> {
+  const base = await readDocumentText(src);
+  if (base.source === 'AI' || !isPdf(src.mimeType, src.fileName)) return { ...base, ocrPages: 0 };
+
+  // Split the text layer back into pages ("[page N]" marks) and find the blank ones.
+  const parts = base.text.split(/^\[page (\d+)\]$/m);
+  const pageText = new Map<number, string>();
+  for (let i = 1; i < parts.length; i += 2) pageText.set(Number(parts[i]), (parts[i + 1] ?? '').trim());
+  const pdf = await PDFDocument.load(await fs.readFile(src.path), { ignoreEncryption: true });
+  const total = pdf.getPageCount();
+  const blank: number[] = [];
+  for (let p = 1; p <= total; p++) if ((pageText.get(p) ?? '').replace(/\s+/g, '').length < BLANK_PAGE_CHARS) blank.push(p);
+  if (!blank.length || blank.length > OCR_MAX_PAGES) return { ...base, ocrPages: 0 };
+
+  const provider = await getLlmProvider();
+  if (provider.name === 'stub') return { ...base, ocrPages: 0 };
+  const opts = { system: OCR_SYSTEM, maxTokens: OCR_MAX_TOKENS, label: 'text:ocr' };
+  for (const p of blank) {
+    const single = await PDFDocument.create();
+    const [page] = await single.copyPages(pdf, [p - 1]);
+    single.addPage(page);
+    const dataBase64 = Buffer.from(await single.save()).toString('base64');
+    const raw = await withRetry(() =>
+      provider.completeParts(
+        [
+          { type: 'text', text: 'Transcribe this page.' },
+          { type: 'document', mimeType: 'application/pdf', dataBase64 },
+        ],
+        opts,
+      ),
+    ).catch(() => '');
+    const read = stripFences(raw);
+    if (read) pageText.set(p, read);
+  }
+  const text = [...Array(total).keys()]
+    .map((i) => `[page ${i + 1}]\n${pageText.get(i + 1) ?? ''}`)
+    .join('\n\n')
+    .trim();
+  return { text, source: 'MIXED', ocrPages: blank.length };
+}
+
+/**
  * Read one file to plain text: directly when it has text, else with the AI
  * provider. `source` says which ("FILE" is free, "AI" spent API credit).
  */
@@ -267,6 +366,7 @@ export async function retrieveReferenceSnippets(
   brands: string[],
   query: string,
   limit = 8,
+  maxChars = SNIPPET_BUDGET_CHARS,
 ): Promise<ReferenceSnippet[]> {
   const words = [...new Set(query.toLowerCase().split(/[^a-z0-9.\/-]+/i).filter((w) => w.length > 1))];
   if (!brands.length || !words.length) return [];
@@ -301,7 +401,7 @@ export async function retrieveReferenceSnippets(
   const out: ReferenceSnippet[] = [];
   let used = 0;
   for (const s of scored) {
-    if (out.length >= limit || used + s.text.length > SNIPPET_BUDGET_CHARS) break;
+    if (out.length >= limit || used + s.text.length > maxChars) break;
     out.push({ file: s.file, text: s.text });
     used += s.text.length;
   }

@@ -8,7 +8,7 @@ import {
   createQuoteSchema,
   idParamSchema,
   listQuotesSchema,
-  renameQuoteSchema,
+  updateQuoteSchema,
 } from './quote.schema';
 import * as quoteService from './quote.service';
 import type { StoredFile } from './quote.service';
@@ -35,6 +35,16 @@ quoteRouter.get(
   }),
 );
 
+// Live generation progress — polled while a quote is PROCESSING.
+quoteRouter.get(
+  '/:id/progress',
+  requirePermission('jobwork.view'),
+  validate(idParamSchema, 'params'),
+  asyncHandler(async (req, res) => {
+    res.json(await quoteService.getQuoteProgress(Number(req.params.id)));
+  }),
+);
+
 // Multipart: customerId/categoryId/brand/title/defaultDiscountPct + `documents` files.
 quoteRouter.post(
   '/',
@@ -54,14 +64,14 @@ quoteRouter.post(
   }),
 );
 
-// Rename the chat.
+// Change the chat's name, customer, brands or selected rules.
 quoteRouter.patch(
   '/:id',
   requirePermission('jobwork.create'),
   validate(idParamSchema, 'params'),
-  validate(renameQuoteSchema),
+  validate(updateQuoteSchema),
   asyncHandler(async (req, res) => {
-    res.json(await quoteService.renameQuote(Number(req.params.id), req.body.title));
+    res.json(await quoteService.updateQuote(Number(req.params.id), req.body));
   }),
 );
 

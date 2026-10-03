@@ -5,3 +5,6 @@ dist/
 uploads/
 # database dumps in the project root hold API keys, SMTP settings and password hashes
 /*.sql
+
+# Python OCR helper cache
+scripts/__pycache__/

@@ -111,6 +111,20 @@ model QuotePrompt {
   @@map("quote_prompts")
 }
 
+/// The AI system prompts the quote pipeline runs with (BOQ extraction, rule-driven
+/// accessories, catalogue matching, chat). Editable in Settings → AI prompts; the
+/// code holds only a seed default per key, inserted the first time a key is read.
+model SystemPrompt {
+  id          Int      @id @default(autoincrement())
+  key         String   @unique @db.VarChar(80)
+  name        String   @db.VarChar(150)
+  description String   @db.Text
+  content     String   @db.LongText
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("system_prompts")
+}
+
 model AppSetting {
   id        Int      @id @default(1)
   appName   String   @default("Jobwork") @map("app_name") @db.VarChar(120)
@@ -178,6 +192,13 @@ model LlmSetting {
   openaiModel     String   @default("gpt-4o") @map("openai_model") @db.VarChar(80)
   anthropicApiKey String?  @map("anthropic_api_key") @db.Text
   anthropicModel  String   @default("claude-opus-4-8") @map("anthropic_model") @db.VarChar(80)
+  /// How Get Quote finds products: "database" = price lists parsed into rows that
+  /// the code shortlists per line; "claude" = the brand's files live in Claude
+  /// (Files API) and Claude reads them directly — nothing parsed into our tables.
+  quoteEngine     String   @default("database") @map("quote_engine") @db.VarChar(20)
+  /// Anthropic workspace id ("wrkspc_…"). Needed for the Files API when the API
+  /// key is an organisation-wide (default) key rather than a workspace-scoped one.
+  anthropicWorkspaceId String? @map("anthropic_workspace_id") @db.VarChar(80)
 
   // Manually-maintained credit balances. Providers don't expose remaining
   // balance via the API key, so an admin sets these and usage is subtracted.
@@ -254,6 +275,9 @@ model Quote {
   bomJson             Json?       @map("bom_json")
   /// Custom download file name set from the chat ("rename the file to …").
   downloadName        String?     @map("download_name") @db.VarChar(190)
+  /// The brand keyword-prompt ids (rules) chosen for this chat, e.g. [3, 7].
+  /// Null = every trained prompt of the selected brands (the default).
+  promptIds           Json?       @map("prompt_ids")
   createdById         Int         @map("created_by_id")
   createdAt           DateTime    @default(now()) @map("created_at")
   updatedAt           DateTime    @updatedAt @map("updated_at")
@@ -370,6 +394,12 @@ model Company {
 /// (series names, trade shorthand, preferences). Every prompt with `train` on is
 /// sent to the model when a quote is generated for that brand.
 model BrandPrompt {
+  /// Knowledge-in-Claude: the Files API id of this rule's text, status and when.
+  /// A rule edited after training goes back to NOT_STARTED until trained again.
+  aiFileId    String?      @map("ai_file_id") @db.VarChar(120)
+  aiStatus    IngestStatus @default(NOT_STARTED) @map("ai_status")
+  aiError     String?      @map("ai_error") @db.Text
+  aiTrainedAt DateTime?    @map("ai_trained_at")
   id        Int      @id @default(autoincrement())
   companyId Int      @map("company_id")
   /// Short label the user gives the prompt, e.g. "Rule 1".
@@ -450,6 +480,21 @@ model ProductDocument {
   /// How the text was obtained: "FILE" = read straight from the file (free),
   /// "AI" = a scan/image read by the AI provider (costs API credit).
   textSource String?      @map("text_source") @db.VarChar(10)
+
+  // ----- Knowledge in Claude (quote engine "claude") -----
+  /// The id Anthropic's Files API returned for this file's text ("file_…"). It
+  /// is all we keep: at quote time the id is sent and Claude reads the file.
+  aiFileId     String?      @map("ai_file_id") @db.VarChar(120)
+  aiStatus     IngestStatus @default(NOT_STARTED) @map("ai_status")
+  aiError      String?      @map("ai_error") @db.Text
+  aiFileChars  Int?         @map("ai_file_chars")
+  aiTrainedAt  DateTime?    @map("ai_trained_at")
+  /// "pdf" = the original PDF itself is in Claude (aiFileId) with its text as a
+  /// second file (aiTextFileId) for when the request's 100-page cap is hit;
+  /// "text" = only the text (aiFileId) — PDFs over 100 pages / 32 MB, other types.
+  aiFileKind   String?      @map("ai_file_kind") @db.VarChar(10)
+  aiPages      Int?         @map("ai_pages")
+  aiTextFileId String?      @map("ai_text_file_id") @db.VarChar(120)
 
   category       ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: Cascade)
   company        Company?         @relation("CompanyPriceLists", fields: [companyId], references: [id], onDelete: SetNull)

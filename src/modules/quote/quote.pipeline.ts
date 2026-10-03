@@ -14,6 +14,7 @@ import type { PriceListItem } from '@prisma/client';
 import type { LlmProvider } from '../../lib/llm';
 import { loadPool, rankCandidates, type RequirementQuery } from '../price-list/price-list.retrieval';
 import { cleanFamily } from '../price-list/price-list.parser';
+import { getPromptText } from '../prompts/prompt.service';
 
 export interface Requirement {
   lineNo: number;
@@ -34,6 +35,21 @@ export interface Requirement {
   /** Release type the spec calls for: "thermal-magnetic" | "microprocessor" | null. */
   releaseType: string | null;
   /**
+   * Breaker construction the BOQ states for this line — "single-break",
+   * "double-break", or any other construction word it uses, verbatim; null when
+   * the BOQ says nothing. BOQs usually state it ONCE in a note ("the incoming MCCB
+   * shall be double-break, all outgoing MCCBs single-break") that applies to
+   * every breaker below, so it is carried onto each line. The brand rules decide
+   * which product series a construction maps to.
+   */
+  construction: string | null;
+  /**
+   * Protection functions the BOQ asks of the release, as the BOQ writes them
+   * ("LSI", "LSIG", "LSING", "LS", …); null when not stated. Also usually a global
+   * note ("250A and above shall be microprocessor based with LSIG release").
+   */
+  protection: string | null;
+  /**
    * Operating / coil voltage the line is specified at, verbatim (e.g. "240VAC",
    * "415VAC", "230V", "24VDC"). Selects a voltage-specific price-list variant when
    * the catalog offers several, keeps lines that differ only by voltage separate,
@@ -49,6 +65,12 @@ export interface Requirement {
    * one line under a shared catalog number.
    */
   variant: string | null;
+  /**
+   * Whether the BOQ lists this item under an INCOMING (incomer, I/C) or OUTGOING
+   * (O/G) feeder heading; accessories inherit their breaker's role. Shown on
+   * every output line so the quote says which is which.
+   */
+  feederRole: 'incoming' | 'outgoing' | null;
   keywords: string[];
 }
 
@@ -90,228 +112,24 @@ export interface PricedLine {
   /** Operating/coil voltage carried from the requirement — same role as variant
    *  (keeps voltage-distinct lines apart, shown in the description). Optional. */
   voltage?: string | null;
+  /** Incoming / outgoing feeder role from the BOQ (see Requirement.feederRole). */
+  feederRole?: 'incoming' | 'outgoing' | null;
 }
 
-const EXTRACT_SYSTEM = [
-  'You are a quotation engineer for an electrical switchgear supplier. You read a',
-  'customer BOQ / specification (often messy, with quantities and ratings embedded',
-  'in prose) and produce a clean list of EVERY electrical line item in it.',
-  '',
-  'SCOPE — extract ALL items, do NOT restrict to one product type: circuit',
-  'breakers of every kind (MCCB, MCB, ACB, RCCB, MPCB), their accessories (aux',
-  'contact, shunt release, spreader terminal, rotary handle, ground-fault unit),',
-  'contactors, overload relays, protection relays, meters (voltmeter/ammeter/MFM),',
-  'current transformers, indicating lamps, push buttons, selector switches, timers,',
-  'terminals, space heaters, thermostats, etc. Downstream matching keeps only the',
-  'items the available brand actually offers and drops the rest — your job is to',
-  'capture the FULL requirement list, not to pre-filter by product type or brand.',
-  '',
-  'QUANTITIES — read them PRECISELY; this is where mistakes happen. Two separate',
-  'numbers drive every line, and you must NOT confuse them or multiply them:',
-  '  • "quantity" = the per-item count for ONE panel. In a BOQ this count is written',
-  '    INSIDE the item description as "1No", "2Nos", "7Nos", "1 Set", "1 Lot" — read',
-  '    the integer from there (e.g. "7Nos - 200A …" → 7). A tabular BOQ usually',
-  '    leaves the row\'s own Quantity/Qty COLUMN BLANK for these item rows; that',
-  '    blank is NOT a quantity — never treat it as 1×nothing, take the count from',
-  '    the description text. Default to 1 only when no count is stated anywhere.',
-  '  • "panelQty" = how many identical panels this item\'s SECTION belongs to. It',
-  '    comes from the nearest PANEL-HEADING row above the item — that heading row',
-  '    is the one that carries a number in the Quantity column with a unit like',
-  '    "Each"/"Set" (e.g. "8.1 Sub LT Panel 1 … 1 Each" → panelQty 1; "8.2 Sub LT',
-  '    Panel 2 & 3 … 2 Each" → panelQty 2). Apply that SAME panelQty to EVERY item',
-  '    under that heading (incoming AND outgoing) until the next panel-heading row.',
-  'NEVER multiply or sum yourself — report {quantity, panelQty} per line and the',
-  'code computes quantity×panelQty and merges same-catalog lines. Emit a SEPARATE',
-  'line for EVERY occurrence in EVERY panel/section (a rating that appears as an',
-  'Incoming in one panel and an Outgoing in another is a separate line each time;',
-  'never drop a panel\'s Incoming breaker).',
-  'Worked example from a two-panel BOQ:',
-  '  Panel 8.1 (heading Qty col = 1 Each) outgoing "2Nos - 250A" → {quantity:2, panelQty:1}',
-  '  Panel 8.2 (heading Qty col = 2 Each) incoming "1No 250A"   → {quantity:1, panelQty:2}',
-  '  → code: 2×1 + 1×2 = a total of 4 × 250A. If you had wrongly copied the panel',
-  '    heading\'s "2" onto the item, or missed a section, the total would be wrong.',
-  '',
-  'RATINGS: for circuit breakers extract rated current (amps), number of poles, and',
-  'breaking capacity (kA) when stated.',
-  '',
-  'BUSBARS & NON-BREAKER ITEMS — do NOT turn a busbar or fabrication line into a',
-  'circuit breaker. A line describing "Aluminium / Copper bus bars" — often written',
-  '"Lot - 800A, 3 Phase and 400A neutral 415V, short circuit rated 50KA for 1sec, TPN',
-  'Aluminium bus bars…" — is the panel BUSBAR system, not an MCCB/MCB: its amp and kA',
-  'figures are the busbar current-carrying / short-circuit-withstand sizing, NOT a',
-  'breaker rating. Emit it as its OWN line, requirement "…Aluminium busbar…", with',
-  'isAccessory false and releaseType null and ratingAmp left null (it is not a breaker',
-  'rating) — NEVER create an 800A / 300A MCCB from it. The same holds for other',
-  'fabrication / material lines (the panel enclosure/CRCA sheet, gland plates, bus-bar',
-  'insulators, PVC sleeves, cable, labels): capture each as its own item, never as a',
-  'breaker. Downstream may leave these for review if the price list has no such row —',
-  'that is correct; do not force them onto an unrelated breaker catalog.',
-  '',
-  'GLOBAL SPECS / NOTES: the BOQ often states requirements ONCE in a heading or a',
-  'note that applies to EVERY item below it (e.g. "All MCCBs shall be adjustable',
-  'with thermal settings (80%-100%), with overload and short-circuit releases, door',
-  'interlock, front operating handle"). Read these carefully and APPLY them to each',
-  'relevant line — do not ignore a requirement just because it is not repeated on',
-  'every line.',
-  '',
-  'RELEASE TYPE: set releaseType for each breaker from the spec:',
-  '  • "thermal-magnetic" — when it asks for adjustable thermal settings, a thermal',
-  '    / thermal-magnetic / "TM" release, or thermal overload + magnetic short-circuit',
-  '    releases (this is the common/default MCCB requirement).',
-  '  • "microprocessor" — when it asks for a microprocessor / electronic / LSIG',
-  '    release, or an "MTX"/electronic trip unit.',
-  '  • null — when the document does not indicate a release type.',
-  '  • CONDITIONAL BY RATING: a note may split the release type by a RATING THRESHOLD.',
-  '    Read the threshold value AND its direction FROM the note, then classify EACH',
-  '    breaker by comparing its OWN rated current to that threshold. The boundary words',
-  '    are INCLUSIVE — a breaker whose rating EQUALS the threshold goes with the side',
-  '    that names it:',
-  '      – "X A and above" / "X A or higher" / "≥ X A"  → the threshold breaker (= X A)',
-  '        AND every larger breaker belong to that clause. So "250A and above shall be',
-  '        microprocessor" makes a 250A breaker MICROPROCESSOR (250 ≥ 250) and a 630A',
-  '        microprocessor, while 200A / 125A / 100A / 63A (all below 250) are the other',
-  '        type (thermal-magnetic).',
-  '      – "X A and below" / "X A or lower" / "≤ X A"  → the threshold breaker (= X A)',
-  '        AND every smaller breaker belong to that clause; larger ones get the other.',
-  '    Apply it per breaker; never stamp one release on all breakers when the note',
-  '    conditions it on rating, and never flip the direction. (The threshold and',
-  '    direction are whatever THIS document states — read them exactly, do not assume.)',
-  'Add the release words to keywords too (e.g. "thermal","magnetic","release").',
-  '',
-  'VARIANTS / COLOURS — some items are listed several times differing ONLY by a',
-  'customer-chosen attribute the price list often does not give a separate catalog',
-  'number for — most commonly the COLOUR of an indicator lamp / LED / pilot light /',
-  'push button / selector (Red, Yellow, Blue, Green, Amber, White, Orange). Rules:',
-  '  • Emit a SEPARATE line for EACH colour that appears as its own item — and capture',
-  '    EVERY colour listed, NONE omitted. If the document lists Red, Yellow, Blue, Green',
-  '    and Amber lamps, you MUST output all FIVE lines (Green and Amber included) — never',
-  '    stop at Red/Yellow/Blue. Keep each line\'s own quantity (e.g. "2 Nos Red, 1 No',
-  '    Yellow, 1 No Blue, 1 No Green, 1 No Amber" → five lines, quantity 2,1,1,1,1).',
-  '  • Set the "variant" field to that colour in Title Case ("Red","Yellow","Blue",',
-  '    "Green","Amber","White"); leave it null when the item has no such variant. Add the',
-  '    colour word to keywords too.',
-  '  • The compact token "RYB" / "RYBN" (e.g. "RYB indicating lamps") is a SEPARATE case:',
-  '    it is shorthand for one lamp per letter — expand it into its own Red, Yellow, Blue',
-  '    (RYBN adds a Neutral/White) lines with quantity = the stated Set/No count. This',
-  '    expansion is ONLY for a literal "RYB"/"RYBN" token; it NEVER limits the colours',
-  '    elsewhere — individually-named Green/Amber/etc. lamps are still emitted in full,',
-  '    IN ADDITION to any RYB set. Do not collapse a list of individual colours into',
-  '    "RYB", and never keep "RYB" itself as one line (no catalog exists for it).',
-  'This applies to any product family, not just lamps: whenever the ONLY difference',
-  'between repeated items is a named colour/variant, keep them as distinct lines and',
-  'record the variant.',
-  '',
-  'KITS / SETS / COMPOSITE LINES — one BOQ line sometimes BUNDLES several distinct',
-  'products, typically joined by "with" / "along with" / "including" / "&" (e.g. "RYB',
-  'indicating lamps of LED module WITH 6A, 230V, 10kA, SP MCB", or "voltmeter with',
-  'selector switch"). Split it into a SEPARATE line for EACH distinct product it names,',
-  'so every component matches its own catalog:',
-  '  • "RYB indicating lamps of LED module with 6A 230V 10kA SP MCB" → the three colour',
-  '    lamp lines (Red/Yellow/Blue, from the rule above) PLUS one line for the "6A, 230V,',
-  '    10kA, SP (single-pole) MCB". Carry each component\'s own ratings/voltage/poles',
-  '    (SP = 1 pole) onto its line.',
-  '  • Apply the line\'s Set/No count to each component (1 Set → quantity 1 for each).',
-  '  • Do not leave a bundled line as one row — a single row naming two products cannot',
-  '    match a catalog and gets mispriced.',
-  '',
-  'TECHNICAL ATTRIBUTES — capture EVERY specified value; never drop one. A price list',
-  'often lists the SAME base product in many variants that differ only by a technical',
-  'value (voltage, rating, class), each with its own catalog suffix and price, so the',
-  'exact value the customer states is what selects the right one:',
-  '  • Read and record every electrical value the line gives — VOLTAGE (V / VAC / VDC,',
-  '    e.g. 240VAC, 415VAC, 230V, 110VDC, 24VDC), rated CURRENT (A), BREAKING capacity',
-  '    (kA), POLES, FREQUENCY (Hz), RESISTANCE (Ω / ohm), power (W / VA / kW), ACCURACY',
-  '    class (Cl 0.5 / 1.0 / 0.5S), IP rating, CT/PT ratio (e.g. 630/5A), cable/busbar',
-  '    size (sq mm). Put EACH stated value WITH its unit into keywords (e.g. "240vac",',
-  '    "50ka", "415v", "630/5a") and KEEP it verbatim in the requirement text.',
-  '  • Fill the structured fields precisely: ratingAmp = rated current in amps;',
-  '    breakingKa = the kA number; poles; releaseType; and voltage = the operating /',
-  '    coil voltage string exactly as stated ("240VAC", "415VAC"). Set a field to null',
-  '    ONLY when the line genuinely omits it — never invent or round a value.',
-  '  • Because these values select the variant, two otherwise-identical lines that',
-  '    differ only by such a value (e.g. an indicator lamp at 240VAC vs 415VAC, or a',
-  '    meter Cl 0.5 vs Cl 1.0) are SEPARATE lines — do not collapse them to a generic',
-  '    one, and do not carry one line\'s value onto another.',
-  '',
-  'TERMINOLOGY GLOSSARY — BOQs use trade shorthand; decode it before extracting so a',
-  'terse spec still yields the right releaseType, poles and accessories:',
-  '  • Microprocessor release (releaseType "microprocessor"): µP, uP, microprocessor,',
-  '    electronic trip, LSI, LSIG, LSIG-N, "L-S-I-G" (these letters are the protection',
-  '    functions Long-time/Short-time/Instantaneous/Ground — their presence implies an',
-  '    electronic trip unit), MTX, ITrP (LK trade names), MicroLogic (Schneider), Ekip',
-  '    (ABB), ETU (Siemens).',
-  '  • Thermal-magnetic release (releaseType "thermal-magnetic"): TM, TMD, TMG, thermal',
-  '    magnetic, adjustable thermal, thermal overload + magnetic short-circuit.',
-  '  • Poles: TP / 3P = 3 poles; FP / 4P = 4 poles; TPN = 3 poles + neutral link (poles',
-  '    3); FPN = 4 poles with rated neutral (poles 4); DP=2, SP=1.',
-  '  • Construction: ACB = air circuit breaker (usually ≥630A, often drawout); MCCB =',
-  '    moulded-case; MCB = miniature; MPCB/MPCB = motor protection breaker; DO/EDO =',
-  '    drawout; FC/FX = fixed. Put the construction word in keywords.',
-  '  • Rating letters (do NOT confuse): In = frame/rated current (use as ratingAmp);',
-  '    Ir / Iset = adjustable overload setting; Icu = ultimate breaking capacity kA',
-  '    (use as breakingKa); Ics = service breaking kA; Icw = short-time withstand kA.',
-  '  • Accessory abbreviations → functional name: ST / SHT / shunt = shunt release;',
-  '    UVT / UVR = under-voltage release; AX / OF / aux = auxiliary contact; SD / AL /',
-  '    trip-alarm = alarm/trip-signal contact; RH / ROM = rotary handle (extended/door',
-  '    = door-interlock handle, direct = internal); GF / earth fault / residual = ground-',
-  '    fault protection; spreader / terminal links = spreader terminals.',
-  '  • Meters: MFM / MDM / MFT = multifunction digital meter (measures V, A, PF, Hz, kW,',
-  '    kWh); needs CT (current transformer) / PT; accuracy class 0.5S or 1.0; Modbus',
-  '    RS485 = comms. A/V-meter = ammeter / voltmeter. Emit each as its own line.',
-  'Use the glossary only to INTERPRET the spec; keep the breaker requirement text',
-  'verbatim from the input, but set releaseType/poles/ratings/accessories accordingly.',
-  '',
-  'ACCESSORIES & ADD-ONS: breakers, switches and starters carry add-on devices.',
-  'Emit EACH accessory the documents call for as its OWN line with isAccessory=true',
-  'and parentLineNo = the lineNo of the device it belongs to (leave quantity 1 — the',
-  'code derives it from the parent). Identify accessories by FUNCTION, which applies',
-  'to any product type and any brand: operating / rotary handle and door-interlock',
-  'mechanism; auxiliary / signalling / trip-alarm contact; shunt / under-voltage /',
-  'trip release; terminal shrouds / spreader links; earth- / ground-fault protection;',
-  'and similar. Rules that make this reliable and correctly counted:',
-  '  1. ONE LINE PER BREAKER. Emit a SEPARATE accessory line for EACH breaker line',
-  '     that needs it, with parentLineNo = THAT breaker line\'s lineNo. Never emit a',
-  '     single accessory line meant to cover several breakers, and never put an',
-  '     aggregate/summed count on an accessory. Always set the accessory quantity to',
-  '     1: the code sets each accessory\'s count from its parent breaker and then',
-  '     sums identical accessories across breakers, so per-breaker lines give the',
-  '     correct total automatically. (If a panel has 4×250A and 9×200A breakers that',
-  '     share one aux-contact catalog, emit an aux-contact line under the 250A line',
-  '     and another under the 200A line — the code totals them to 13.)',
-  '  2. GLOBAL notes count. When a heading or note says every device in a panel',
-  '     needs an accessory (e.g. "…including door interlocking device, front',
-  '     operating handle", "with earth fault protection"), emit that accessory under',
-  '     EVERY breaker line beneath that note — do not skip it because it is stated',
-  '     once in a note rather than repeated on each line.',
-  '  3. ONE LINE PER FUNCTION, WORDED BY FUNCTION. For a given breaker, emit at most',
-  '     one line per accessory function, and word its "requirement" as the STANDARD',
-  '     accessory name — not the verbatim note phrase. Map the described accessory to',
-  '     its functional name. A DOOR-INTERLOCK / FRONT / DOOR-MOUNTED operating handle',
-  '     is the EXTENDED rotary handle (extended ROM) — NOT the internal Direct ROM: so',
-  '     "door interlocking device / front operating handle" → requirement "Extended',
-  '     rotary handle (door interlock)" with keywords ["extended","rotary","handle",',
-  '     "door"]. (Use "Direct rotary handle" / ["direct","rotary","handle"] only when',
-  '     the spec explicitly wants an internal/direct-mounted handle.) "overload +',
-  '     short-circuit releases" is the breaker itself, not an accessory. A long',
-  '     verbatim note phrase cannot be matched, so always use the short functional name.',
-  '  4. Be consistent. For the same input, emit the SAME accessory set every time;',
-  '     never itemise an accessory on one reading and drop it on another. Always emit',
-  '     accessories as their own lines — never fold them into the breaker line text.',
-  'Stay faithful: only emit accessories the documents actually ask for (explicitly or',
-  'through a global note); do not invent ones the spec never mentions. Downstream',
-  'matching keeps only the accessories the chosen brand offers and drops the rest, so',
-  'when a required accessory is genuinely in scope, emit it. Give each accessory line',
-  'specific lowercase keywords (e.g. ["auxiliary","contact"], ["shunt","release"],',
-  '["spreader","terminal"], ["rotary","handle"], ["earth","fault"]).',
-  '',
-  'KEYWORDS: 3-8 lowercase keywords per line drawn from the product type so a',
-  'catalogue search can find it. For breakers keep the requirement text verbatim from',
-  'the input; for accessories use the short functional name (rule 3) as the',
-  'requirement so it stays matchable and consolidates cleanly. If the additional',
-  'instructions or brand rules require a particular product SERIES or frame (a code',
-  'such as "DZ", "DN", "DU"), put that series code in lowercase into the keywords of',
-  'every line it applies to — the catalogue search ranks rows carrying it first.',
-].join('\n');
+// The extraction / accessory / matching instruction texts live in the system_prompts
+// table (Settings → AI prompts), seeded from ../prompts/prompt.defaults.ts.
+
+/** "Incomer", "I/C", "incoming" → incoming; "O/G", "outgoing" → outgoing; else null. */
+function normaliseRole(raw: unknown): 'incoming' | 'outgoing' | null {
+  const s = String(raw ?? '').toLowerCase();
+  if (/incom|i\/c/.test(s)) return 'incoming';
+  if (/outgo|o\/g/.test(s)) return 'outgoing';
+  return null;
+}
+
+/** "Incoming" / "Outgoing" for display, or null. */
+export const roleLabel = (role: 'incoming' | 'outgoing' | null | undefined): string | null =>
+  role === 'incoming' ? 'Incoming' : role === 'outgoing' ? 'Outgoing' : null;
 
 /** Strip ``` fences and parse a JSON value the model returned. */
 function parseJson<T>(raw: string): T {
@@ -329,35 +147,18 @@ export async function extractRequirements(
   ctx: { brand: string; category: string },
   extraInstructions = '',
 ): Promise<Requirement[]> {
+  const base = await getPromptText('quote.extract.system');
   const system = extraInstructions.trim()
-    ? `${EXTRACT_SYSTEM}\n\nADDITIONAL INSTRUCTIONS (from the user's saved prompt — follow these too, and let them override the defaults above where they conflict):\n${extraInstructions.trim()}`
-    : EXTRACT_SYSTEM;
+    ? `${base}\n\nADDITIONAL INSTRUCTIONS (the customer's message and the brand rules chosen for this quote — follow these too, let them override the defaults above where they conflict, and treat any accessory they make mandatory or conditional as required per accessory rule 5):\n${extraInstructions.trim()}`
+    : base;
   const user =
     `Preferred brand: ${ctx.brand}${ctx.category ? ` (primary product: ${ctx.category})` : ''}. ` +
     'Extract EVERY line item from the documents below — all product types, not just ' +
     'the primary product.\n\n' +
-    // Compact cap: the BOQ (quantity source) is small and comes first, so it is
-    // always included in full; this keeps token cost down while still covering the
-    // BOQ + its notes and a good slice of the spec.
-    `Input documents:\n${inputText.slice(0, 45000)}\n\n` +
-    'Return a JSON object {"lines": Requirement[]} where each Requirement is ' +
-    '{ "lineNo": number, "requirement": string, "quantity": number, ' +
-    '"panelQty": number, "isAccessory": boolean, "parentLineNo": number|null, ' +
-    '"ratingAmp": number|null, "poles": number|null, "breakingKa": number|null, ' +
-    '"releaseType": string|null, "voltage": string|null, "variant": string|null, ' +
-    '"board": string|null, "keywords": string[] }. ' +
-    'board = the panel/board this item belongs to, exactly as the BOQ names it ' +
-    '(e.g. "MV PANEL", "SUB MV PANEL", "Sub LT Panel 1"); apply the nearest panel ' +
-    'heading above the item to every item under it, until the next panel heading. ' +
-    'voltage is the operating/coil voltage exactly as stated ("240VAC", "415VAC", ' +
-    '"230V", "24VDC") or null; capture every technical value (V/A/kA/Hz/Ω/class) into ' +
-    'keywords too. ' +
-    'variant is a distinguishing attribute like an indicator-lamp colour ("Red", ' +
-    '"Yellow", …) when the item has one, else null — emit a separate line per colour. ' +
-    'quantity is the per-panel count and panelQty is the number of identical panels ' +
-    '(default 1); the code multiplies them. ' +
-    'lineNo starts at 1. parentLineNo is null for breakers; for an accessory it is ' +
-    "the lineNo of the breaker it belongs to.";
+    // The reader already shares INPUT_BUDGET_CHARS across all attached files; this
+    // is only a last-resort guard so one call can never exceed the context window.
+    `Input documents:\n${inputText.slice(0, 160_000)}\n\n` +
+    (await getPromptText('quote.extract.fields'));
   const raw = await provider.complete([{ role: 'user', content: user }], {
     system,
     json: true,
@@ -382,8 +183,17 @@ export async function extractRequirements(
     poles: l.poles != null ? Number(l.poles) : null,
     breakingKa: l.breakingKa != null ? Number(l.breakingKa) : null,
     releaseType: l.releaseType != null ? String(l.releaseType).toLowerCase().slice(0, 40) : null,
+    construction:
+      l.construction != null && String(l.construction).trim()
+        ? String(l.construction).trim().toLowerCase().slice(0, 40)
+        : null,
+    protection:
+      l.protection != null && String(l.protection).trim()
+        ? String(l.protection).trim().toUpperCase().slice(0, 20)
+        : null,
     voltage: l.voltage != null && String(l.voltage).trim() ? String(l.voltage).trim().slice(0, 40) : null,
     variant: l.variant != null && String(l.variant).trim() ? String(l.variant).trim().slice(0, 40) : null,
+    feederRole: normaliseRole(l.feederRole),
     keywords: Array.isArray(l.keywords) ? l.keywords.map(String).slice(0, 12) : [],
     };
   });
@@ -441,6 +251,16 @@ const ACC_DEFS: Record<AccKey, { requirement: string; keywords: string[] }> = {
   gf: { requirement: 'Ground fault module', keywords: ['ground', 'fault', 'module'] },
 };
 
+/** Recognises an accessory of each kind in an already-extracted child line. */
+const ACC_PRESENT: Record<AccKey, RegExp> = {
+  spreader: /spreader/,
+  handle: /rotary|operating\s*handle|door\s*interlock|\brom\b/,
+  aux: /auxiliary|aux\b|trip\s*alarm|signal/,
+  shunt: /shunt/,
+  uv: /under[\s-]*voltage|\buv\b/,
+  gf: /ground\s*fault|earth\s*fault|\bgf\b/,
+};
+
 /** The base accessories every MCCB gets in any bundle. */
 const BASE_BUNDLE: AccKey[] = ['spreader', 'handle'];
 
@@ -483,7 +303,9 @@ export function ensureStandardMccbAccessories(reqs: Requirement[], docText = '')
     const attach = (key: AccKey) => {
       const def = ACC_DEFS[key];
       const kws = key === 'gf' && b.ratingAmp ? def.keywords : def.keywords;
-      const already = childrenSig.some((s) => def.keywords.every((k) => s.includes(k)));
+      // Already emitted by the extraction (from the BOQ or a brand rule) under this
+      // breaker — in any wording ("Spreader link", "Spreader terminals").
+      const already = childrenSig.some((s) => ACC_PRESENT[key].test(s));
       if (already) return;
       out.push({
         lineNo: nextLine++,
@@ -497,8 +319,11 @@ export function ensureStandardMccbAccessories(reqs: Requirement[], docText = '')
         poles: b.poles, // spreader/handle come in pole variants — keep the parent's pole count
         breakingKa: null,
         releaseType: null,
+        construction: null,
+        protection: null,
         voltage: null,
         variant: null,
+        feederRole: b.feederRole,
         keywords: kws,
       });
     };
@@ -516,6 +341,117 @@ export function ensureStandardMccbAccessories(reqs: Requirement[], docText = '')
     if (wantsGf) attach('gf');
   }
   return out;
+}
+
+/**
+ * Step 1b — RULE-DRIVEN ACCESSORIES. A focused AI call whose main content is the
+ * brand rules (and the customer's instructions): for every breaker the extraction
+ * found, it lists the accessories those rules make mandatory ("every MCCB gets an
+ * extended rotary handle and a pole-matched spreader link") or conditional
+ * ("LSIG on 3P → external neutral CT + adaptor kit"), and flags accessories already
+ * on the line that the rules say are NOT required (e.g. a ground-fault module on a
+ * 4P breaker whose release has ground fault built in).
+ *
+ * This exists because the rules were previously a footnote at the end of the
+ * ~11k-token extraction prompt and the model kept to the BOQ's literal lines.
+ * Here the rules ARE the task. Nothing is hard-coded: with no rules and no
+ * instructions the step is skipped and the lines pass through unchanged.
+ */
+export async function applyRuleAccessories(
+  provider: LlmProvider,
+  reqs: Requirement[],
+  guidance: { brandNotes: string; customerNotes: string },
+): Promise<Requirement[]> {
+  const brandNotes = guidance.brandNotes.trim();
+  const customerNotes = guidance.customerNotes.trim();
+  if (!brandNotes && !customerNotes) return reqs;
+  // Only rated devices (breakers, switches, starters) carry accessories.
+  const devices = reqs.filter((r) => !r.isAccessory && r.ratingAmp != null);
+  if (!devices.length) return reqs;
+
+  const payload = devices.map((d) => ({
+    lineNo: d.lineNo,
+    requirement: d.requirement,
+    ratingAmp: d.ratingAmp,
+    poles: d.poles,
+    breakingKa: d.breakingKa,
+    releaseType: d.releaseType,
+    construction: d.construction,
+    protection: d.protection,
+    feederRole: d.feederRole,
+    board: d.board,
+    quantity: d.quantity,
+    accessories: reqs
+      .filter((a) => a.isAccessory && a.parentLineNo === d.lineNo)
+      .map((a) => ({ lineNo: a.lineNo, requirement: a.requirement })),
+  }));
+
+  const system = [
+    await getPromptText('quote.accessories.system'),
+    ...(brandNotes ? ['', 'BRAND RULES:', brandNotes] : []),
+    ...(customerNotes ? ['', 'CUSTOMER INSTRUCTIONS:', customerNotes] : []),
+  ].join('\n');
+
+  const raw = await provider.complete(
+    [{ role: 'user', content: `Breakers:\n${JSON.stringify(payload)}` }],
+    { system, json: true, maxTokens: 6000, label: 'quote:accessories' },
+  );
+  type Out = {
+    breakers?: {
+      lineNo: number;
+      add?: { requirement: string; keywords?: string[]; quantity?: number; reason?: string }[];
+      remove?: { lineNo: number; reason?: string }[];
+    }[];
+  };
+  const parsed = parseJson<Out>(raw);
+  const byLine = new Map(reqs.map((r) => [r.lineNo, r]));
+  const removed = new Set<number>();
+  const added: Requirement[] = [];
+  let nextLine = reqs.reduce((m, r) => Math.max(m, r.lineNo), 0) + 1;
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+  for (const b of parsed.breakers ?? []) {
+    const parent = byLine.get(Number(b.lineNo));
+    if (!parent || parent.isAccessory) continue;
+    for (const rm of b.remove ?? []) {
+      const child = byLine.get(Number(rm.lineNo));
+      if (child?.isAccessory && child.parentLineNo === parent.lineNo) removed.add(child.lineNo);
+    }
+    const existing = reqs
+      .filter((a) => a.isAccessory && a.parentLineNo === parent.lineNo && !removed.has(a.lineNo))
+      .map((a) => norm(a.requirement));
+    for (const add of b.add ?? []) {
+      const requirement = String(add.requirement ?? '').trim().slice(0, 200);
+      if (!requirement) continue;
+      const n = norm(requirement);
+      // Same accessory already there (in any wording) → skip, never duplicate.
+      if (existing.some((e) => e === n || e.includes(n) || n.includes(e))) continue;
+      existing.push(n);
+      const perBreaker = Number(add.quantity) > 0 ? Math.round(Number(add.quantity)) : 1;
+      added.push({
+        lineNo: nextLine++,
+        requirement,
+        quantity: perBreaker * parent.quantity,
+        panelQty: parent.panelQty,
+        isAccessory: true,
+        parentLineNo: parent.lineNo,
+        board: parent.board,
+        ratingAmp: parent.ratingAmp, // a frame/rating-scoped accessory resolves to the parent's frame
+        poles: parent.poles, // pole-specific accessories (spreader, handle) keep the parent's poles
+        breakingKa: null,
+        releaseType: null,
+        construction: null,
+        protection: null,
+        voltage: null,
+        variant: null,
+        feederRole: parent.feederRole,
+        keywords: Array.isArray(add.keywords)
+          ? add.keywords.map((k) => String(k).toLowerCase()).slice(0, 8)
+          : n.split(' ').slice(0, 5),
+      });
+    }
+  }
+  return [...reqs.filter((r) => !removed.has(r.lineNo)), ...added];
 }
 
 /** Detect the panel's control/indication voltage (L-N of the supply). */
@@ -554,7 +490,8 @@ export function ensureFeederIndication(reqs: Requirement[], docText = ''): Requi
     maxByBoard.set(b, Math.max(maxByBoard.get(b) ?? 0, m.ratingAmp ?? 0));
   }
   const isIncomer = (m: Requirement) =>
-    /\bincom|i\/c\b/i.test(m.requirement) ||
+    m.feederRole === 'incoming' ||
+    (m.feederRole !== 'outgoing' && /\bincom|i\/c\b/i.test(m.requirement)) ||
     (m.ratingAmp != null && m.ratingAmp === maxByBoard.get(m.board ?? ''));
 
   const cv = controlVoltage(docText);
@@ -585,8 +522,11 @@ export function ensureFeederIndication(reqs: Requirement[], docText = ''): Requi
         poles: null,
         breakingKa: null,
         releaseType: null,
+        construction: null,
+        protection: null,
         voltage: cv,
         variant: colour,
+        feederRole: m.feederRole,
         keywords: ['led', 'indicator', 'lamp', colour.toLowerCase()],
       });
     }
@@ -604,8 +544,11 @@ export function ensureFeederIndication(reqs: Requirement[], docText = ''): Requi
         poles: 1,
         breakingKa: null,
         releaseType: null,
+        construction: null,
+        protection: null,
         voltage: null,
         variant: null,
+        feederRole: m.feederRole,
         keywords: ['mcb', 'single', 'pole', '6a'],
       });
     }
@@ -737,19 +680,43 @@ const MATCH_CANDIDATES = 8;
 const MATCH_BATCH = 5;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Everything the user supplied that must steer the catalog choice, besides the
+ * BOQ itself: the brand rules picked for the chat, what the customer typed, and
+ * a lookup into the brands' reference files. All optional.
+ */
+export interface MatchGuidance {
+  /** The selected brand keyword prompts (rules), as text. */
+  brandNotes?: string;
+  /** The customer's own instructions typed with the BOQ. */
+  customerNotes?: string;
+  /** Finds reference-file passages for a batch of requirement texts. */
+  retrieveReference?: (query: string) => Promise<{ file: string; text: string }[]>;
+  /** Called before each batch with its 1-based number and the batch count. */
+  onBatch?: (batch: number, total: number) => void;
+  /** Every requirement of the quote (set by matchRequirements) — batch context. */
+  allRequirements?: Requirement[];
+}
+
 export async function matchRequirements(
   provider: LlmProvider,
   requirements: Requirement[],
   candidates: Map<number, PriceListItem[]>,
   targetSeries: string[] = [],
-  /** The quoted brands' trained keyword prompts (Brands page), or ''. */
-  brandNotes = '',
+  guidance: MatchGuidance = {},
 ): Promise<MatchDecision[]> {
   // Process in small batches so a big BOQ never exceeds the token-per-minute cap.
   const out: MatchDecision[] = [];
+  const batches = Math.ceil(requirements.length / MATCH_BATCH);
+  const ctx: MatchGuidance = { ...guidance, allRequirements: requirements };
   for (let i = 0; i < requirements.length; i += MATCH_BATCH) {
     const batch = requirements.slice(i, i + MATCH_BATCH);
-    out.push(...(await matchBatch(provider, batch, candidates, targetSeries, brandNotes)));
+    guidance.onBatch?.(i / MATCH_BATCH + 1, batches);
+    // Reference-file passages that match THIS batch's lines (free keyword lookup).
+    const refs = guidance.retrieveReference
+      ? await guidance.retrieveReference(batch.map((r) => r.requirement).join(' '))
+      : [];
+    out.push(...(await matchBatch(provider, batch, candidates, targetSeries, ctx, refs)));
     if (i + MATCH_BATCH < requirements.length) await sleep(2500); // pace vs TPM
   }
   return out;
@@ -760,8 +727,11 @@ async function matchBatch(
   requirements: Requirement[],
   candidates: Map<number, PriceListItem[]>,
   targetSeries: string[],
-  brandNotes: string,
+  guidance: MatchGuidance,
+  refs: { file: string; text: string }[],
 ): Promise<MatchDecision[]> {
+  const brandNotes = guidance.brandNotes?.trim() ?? '';
+  const customerNotes = guidance.customerNotes?.trim() ?? '';
   // Compact payload: only the fields the model needs to choose.
   const payload = requirements.map((r) => ({
     lineNo: r.lineNo,
@@ -770,6 +740,12 @@ async function matchBatch(
     poles: r.poles,
     breakingKa: r.breakingKa,
     releaseType: r.releaseType,
+    // The BOQ's construction / protection words and the feeder role go with the
+    // line so the brand rules ("double-break → …", "LSIG → …", "incoming → …")
+    // can actually be applied to it.
+    construction: r.construction,
+    protection: r.protection,
+    feederRole: r.feederRole,
     candidates: (candidates.get(r.lineNo) ?? []).slice(0, MATCH_CANDIDATES).map((c) => ({
       catalogNo: c.catalogNo,
       description: c.description, // includes the release type (e.g. "Thermal-Magnetic Release")
@@ -783,64 +759,63 @@ async function matchBatch(
   }));
 
   const system = [
-    'You select the correct catalog number for each requirement line from its own',
-    'candidate list. Rules:',
-    '1. You MUST choose a catalogNo that appears in that line\'s candidates, or null.',
-    '   Never invent a catalog number and never use another line\'s candidate.',
-    '2. Only match when the candidate is the SAME KIND of product as the requirement',
-    '   — an MCCB requirement must map to an MCCB, an auxiliary contact to an aux',
-    '   contact, a shunt release to a shunt release, and so on. If the candidates are',
-    '   a different type of product than the requirement, return null.',
-    '   IMPORTANT: an MCB requirement (a "MCB", NOT an "MCCB") MUST map to an MCB',
-    '   candidate (its description/family says "MCB" / "Miniature Circuit Breaker") —',
-    '   do NOT return null just because same-rating MCCBs also appear in the list, and',
-    '   never map an MCB to an MCCB or vice-versa. The same applies to RCCB, isolator,',
-    '   changeover switch, contactor, relay and meter requirements: pick the candidate',
-    '   of THAT product type when one is present.',
-    '3. For breakers, match the rated current, poles and breaking capacity.',
-    '   ALSO match the RELEASE TYPE and product series the requirement specifies:',
-    '   - requirement.releaseType "thermal-magnetic" MUST map to a candidate whose',
-    '     description says "Thermal-Magnetic Release" — NOT a "Microprocessor Release"',
-    '     variant, even if the microprocessor one is cheaper or a closer rating.',
-    '   - "microprocessor" maps only to a "Microprocessor Release" candidate.',
-    '   - Stay within the same product SERIES/family the spec implies (e.g. an',
-    '     adjustable "dsine" DN-series MCCB, not a basic DU/DY-series one that merely',
-    '     shares the rating). Do NOT downgrade to a different series or release type',
-    '     just because it is cheaper.',
-    '   Only when release type AND series match equally should you then prefer the',
-    '   lower-priced candidate. If no candidate has the required release type/series,',
-    '   pick the closest correct-series one and lower confidence, or null.',
-    '   BREAKING CAPACITY: a candidate with a HIGHER kA than required is acceptable',
-    '   (a higher kA always satisfies the spec). Prefer the exact kA, but if the',
-    '   required release-type/series only exists at a higher kA (e.g. a 125A adjustable',
-    '   TM breaker is only available at 36kA when 25kA was asked), choose that higher-kA',
-    '   part rather than returning null. Never go BELOW the required kA.',
+    await getPromptText('quote.match.system'),
     ...(targetSeries.length
       ? [
-          `4. These items are for the ${targetSeries.join('/').toUpperCase()} product`,
-          '   series. An accessory must be for that same series. If the only candidates',
-          '   are for a different series (e.g. DZ, DN4, DU when the target is DN0-DN3),',
-          '   return null rather than picking the wrong-series part.',
+          `ACCESSORY lines only: the quote's breakers are from the ${targetSeries.join('/').toUpperCase()}`,
+          'series, so an accessory must be for its parent breaker\'s series; if its only',
+          'candidates are for a different series, return null rather than a wrong-series',
+          'part. (This list says nothing about which series a BREAKER line must be.)',
         ]
       : []),
-    '5. Prefer null over a weak guess. Use confidence < 0.4 when unsure; a null match',
-    '   should have confidence 0. It is correct and expected to return null for items',
-    '   whose product line is not in the candidates (they will be flagged for review).',
-    'Give a one-line reason for each decision.',
-    ...(brandNotes.trim()
+    ...(brandNotes
       ? [
           '',
-          "BRAND NOTES (the user's saved keyword prompts for the quoted brand — use them to",
+          "BRAND RULES (the user's saved keyword prompts for the quoted brand — use them to",
           'interpret the requirement and to choose between candidates; rule 1 still holds, so',
           'only ever pick a catalogNo from that line\'s candidates):',
-          brandNotes.trim(),
+          brandNotes,
+        ]
+      : []),
+    ...(customerNotes
+      ? [
+          '',
+          'CUSTOMER INSTRUCTIONS (typed by the user with this BOQ — follow them when choosing,',
+          'within rule 1):',
+          customerNotes,
+        ]
+      : []),
+    ...(refs.length
+      ? [
+          '',
+          "REFERENCE TEXT (passages from the brand's reference files that mention these",
+          'items — product notes, ordering codes, series descriptions; use them to understand',
+          'the products, never as a source of catalog numbers outside the candidates):',
+          ...refs.map((s) => `--- ${s.file} ---\n${s.text}`),
         ]
       : []),
   ].join('\n');
+  // Every breaker of the whole quote with its BOQ facts, so a 5-line batch applies
+  // the series rule exactly as the other batches do (same facts → same series).
+  const allBreakers = (guidance.allRequirements ?? requirements)
+    .filter((r) => !r.isAccessory && r.ratingAmp != null)
+    .map((r) => ({
+      lineNo: r.lineNo,
+      requirement: r.requirement,
+      ratingAmp: r.ratingAmp,
+      poles: r.poles,
+      releaseType: r.releaseType,
+      construction: r.construction,
+      protection: r.protection,
+      feederRole: r.feederRole,
+    }));
   const user =
+    `ALL BREAKERS of this quote (context only — match just the lines below):\n${JSON.stringify(allBreakers)}\n\n` +
     `Lines with candidates:\n${JSON.stringify(payload)}\n\n` +
     'Return {"matches": [{ "lineNo": number, "catalogNo": string|null, ' +
-    '"confidence": number, "reason": string }]}.';
+    '"confidence": number, "reason": string }]}. For a breaker the reason must name ' +
+    'the series the rules allowed for it and why (construction / protection / role ' +
+    'fact → rule), then the row chosen.';
 
   const raw = await provider.complete([{ role: 'user', content: user }], {
     system,
@@ -932,6 +907,8 @@ export function priceLines(
     const d = s.toLowerCase();
     if (/ground fault/.test(d)) return 'gf';
     if (/spreader/.test(d)) return 'spreader';
+    // A door key-lock "for Extended ROM" is a lock, not the handle itself.
+    if (/key\s*lock|padlock|locking device/.test(d)) return 'lock';
     if (/rotary handle|extended rom|direct rom|operating handle/.test(d)) return 'rotary';
     if (/shunt/.test(d)) return 'shunt';
     if (/under voltage|uv release/.test(d)) return 'uv';
@@ -966,17 +943,35 @@ export function priceLines(
     const cls = accClass(`${r.requirement} ${r.keywords.join(' ')}`) ?? accClass(item?.description ?? '');
     if (!cls || cls === 'gf') return item; // GF resolved by pickGroundFault
     const kw = r.keywords.map((k) => k.toLowerCase());
+    const reqText = `${r.requirement} ${kw.join(' ')}`.toLowerCase();
     const wantAc = kw.includes('ac');
     const wantTac = kw.includes('tac');
-    const wantExtended = kw.includes('extended');
-    const wantPole = kw.find((k) => /^\d\s*pole$/.test(k))?.[0];
-    const ok = (cd: string, frame: string): boolean =>
-      accClass(cd) === cls &&
-      cd.includes(frame) &&
-      (!wantAc || /\bac\b/.test(cd)) &&
-      (!wantTac || /\+\s*tac|\btac\b/.test(cd)) &&
-      (!wantExtended || /extended/.test(cd)) &&
-      (!wantPole || /\b(\d)\s*pole\b/.exec(cd)?.[1] === wantPole);
+    // The variant words come from the line's own wording — which the brand rules /
+    // BOQ dictated ("Extended rotary handle", "Direct rotary handle").
+    const wantExtended = /\bextended\b/.test(reqText);
+    const wantDirect = !wantExtended && /\bdirect\b/.test(reqText);
+    // Pole-specific accessories (spreader links etc.) follow the breaker's pole
+    // count: stated on the line ("4 pole", "4p") or inherited from the parent.
+    const wantPole =
+      /\b(\d)\s*(?:pole|p)\b/.exec(reqText)?.[1] ?? (r.poles != null ? String(r.poles) : undefined);
+    const ok = (cd: string, frame: string): boolean => {
+      const cdPole = /\b(\d)\s*pole\b/.exec(cd)?.[1];
+      // The section heading can list both variants — "Rotary Mechanism
+      // (Direct/Extended) — DZ7 Direct ROM" — so judge the variant on the row's own
+      // name with parenthesised heading text removed.
+      const cdVariant = cd.replace(/\([^)]*\)/g, ' ');
+      return (
+        accClass(cd) === cls &&
+        cd.includes(frame) &&
+        (!wantAc || /\bac\b/.test(cd)) &&
+        (!wantTac || /\+\s*tac|\btac\b/.test(cd)) &&
+        (!wantExtended || /extended/.test(cdVariant)) &&
+        (!wantDirect || /direct/.test(cdVariant)) &&
+        // Only pole-variant catalogue rows are checked for the pole count; a row
+        // with no pole in its name fits any breaker.
+        (!wantPole || cdPole == null || cdPole === wantPole)
+      );
+    };
     const itemDesc = (item?.description ?? '').toLowerCase();
     // Keep the current pick only if it already matches the SPECIFIC frame (best),
     // or matches the base and no specific-frame candidate exists.
@@ -1103,7 +1098,10 @@ export function priceLines(
       // Append the variant (lamp colour) and voltage to the matched item's
       // description so the quote shows "… — Red, 240VAC" and lines that differ only
       // by such a detail read as distinct, even when they share one catalog number.
-      description: withDetails(item?.description ?? null, [r.variant, r.voltage]),
+      // An unmatched line keeps its BOQ wording as the base so the row never
+      // collapses to just "Blue, 240VAC". The Incoming/Outgoing role is NOT part of
+      // the description — the BOM shows it once, on the feeder header.
+      description: withDetails(item?.description ?? r.requirement, [r.variant, r.voltage]),
       listPrice,
       discountPct,
       rate,
@@ -1113,6 +1111,7 @@ export function priceLines(
       priceListItemId: item?.id ?? null,
       variant: r.variant ?? null,
       voltage: r.voltage ?? null,
+      feederRole: r.feederRole ?? null,
       board: r.board ?? null,
       parentLineNo: r.parentLineNo ?? null,
       lineRef: r.lineNo,

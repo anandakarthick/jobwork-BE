@@ -273,9 +273,22 @@ function buildDescription(item: {
   return parts.join(', ');
 }
 
-/** Normalise an MCCB/ACB section heading into a release-type label, or null. */
+/**
+ * Normalise an MCCB/ACB section heading into a release-type label, or null.
+ * A heading that names the release MODEL ("DZ MCCB with Microprocessor Release
+ * iTRP3", "DN MCCB with Microprocessor Release MTX2.0") keeps that model, exactly
+ * as the price list prints it — the catalogue lists iTRP1 and iTRP3 rows on
+ * different pages with otherwise identical descriptions, and the model is the
+ * only thing telling them apart. What each model protects (LSI / LSIG) is left to
+ * the brand rules and reference text, not hard-coded here.
+ */
 function releaseFromHeading(text: string): string | null {
-  if (/micro\s*processor/i.test(text)) return 'Microprocessor Release';
+  if (/micro\s*processor/i.test(text)) {
+    const models = [...text.matchAll(/\b(iTRP\s*\d|MTX\s*\d(?:\.\d)?)\b/gi)].map((m) =>
+      m[1]!.replace(/\s+/g, '').replace(/^itrp/i, 'iTRP').replace(/^mtx/i, 'MTX'),
+    );
+    return models.length ? `Microprocessor Release ${models.join(' & ')}` : 'Microprocessor Release';
+  }
   if (/motor\s+protection/i.test(text)) return 'Motor Protection Release';
   if (/thermal\s*-?\s*magnetic\s+release/i.test(text)) return 'Thermal-Magnetic Release';
   return null;

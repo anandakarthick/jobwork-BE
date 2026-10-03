@@ -3,15 +3,13 @@ import { asyncHandler } from '../../middleware/async-handler';
 import { requireAuth, requirePermission } from '../../middleware/auth';
 import { validate } from '../../middleware/validate';
 import {
-  createQuotePromptSchema,
   updateAppSchema,
   updateLetterheadSchema,
   updateLlmSchema,
-  updateQuotePromptSchema,
   updateSmtpSchema,
 } from './settings.schema';
 import * as settingsService from './settings.service';
-import { HttpError } from '../../lib/http-error';
+import * as promptService from '../prompts/prompt.service';
 
 export const settingsRouter = Router();
 
@@ -79,6 +77,32 @@ settingsRouter.put(
   }),
 );
 
+// AI prompts the quote pipeline runs with — stored in the table, editable here.
+settingsRouter.get(
+  '/prompts',
+  requirePermission('settings.view'),
+  asyncHandler(async (_req, res) => {
+    res.json(await promptService.listPrompts());
+  }),
+);
+
+settingsRouter.put(
+  '/prompts/:key',
+  requirePermission('settings.edit'),
+  asyncHandler(async (req, res) => {
+    const content = typeof req.body?.content === 'string' ? req.body.content : '';
+    res.json(await promptService.updatePrompt(String(req.params.key), content));
+  }),
+);
+
+settingsRouter.post(
+  '/prompts/:key/reset',
+  requirePermission('settings.edit'),
+  asyncHandler(async (req, res) => {
+    res.json(await promptService.resetPrompt(String(req.params.key)));
+  }),
+);
+
 // Letter-pad (letterhead) design — view needs settings.view, edit settings.edit.
 settingsRouter.get(
   '/letterhead',
@@ -106,44 +130,3 @@ settingsRouter.put(
   }),
 );
 
-// ---------- Quote prompt snippets (appended to the extraction prompt) ----------
-const promptId = (raw: string | undefined): number => {
-  const id = Number(raw);
-  if (!Number.isInteger(id) || id <= 0) throw HttpError.badRequest('Invalid prompt id');
-  return id;
-};
-
-settingsRouter.get(
-  '/quote-prompts',
-  requirePermission('settings.view'),
-  asyncHandler(async (_req, res) => {
-    res.json(await settingsService.listQuotePrompts());
-  }),
-);
-
-settingsRouter.post(
-  '/quote-prompts',
-  requirePermission('settings.edit'),
-  validate(createQuotePromptSchema),
-  asyncHandler(async (req, res) => {
-    res.status(201).json(await settingsService.createQuotePrompt(req.body));
-  }),
-);
-
-settingsRouter.put(
-  '/quote-prompts/:id',
-  requirePermission('settings.edit'),
-  validate(updateQuotePromptSchema),
-  asyncHandler(async (req, res) => {
-    res.json(await settingsService.updateQuotePrompt(promptId(req.params.id), req.body));
-  }),
-);
-
-settingsRouter.delete(
-  '/quote-prompts/:id',
-  requirePermission('settings.edit'),
-  asyncHandler(async (req, res) => {
-    await settingsService.deleteQuotePrompt(promptId(req.params.id));
-    res.status(204).end();
-  }),
-);

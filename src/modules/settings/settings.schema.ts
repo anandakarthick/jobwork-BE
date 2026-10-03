@@ -4,6 +4,10 @@ export const updateLlmSchema = z.object({
   provider: z.enum(['stub', 'openai', 'claude']),
   openaiModel: z.string().trim().min(1).max(80).optional(),
   anthropicModel: z.string().trim().min(1).max(80).optional(),
+  // How Get Quote finds products — parsed rows in our DB, or the brand files in Claude.
+  quoteEngine: z.enum(['database', 'claude']).optional(),
+  // Anthropic workspace id ("wrkspc_…"); empty string clears it.
+  anthropicWorkspaceId: z.string().trim().max(80).optional(),
   // Keys: provide a value to set; omit or leave empty to keep the current one.
   openaiApiKey: z.string().max(500).optional(),
   anthropicApiKey: z.string().max(500).optional(),
@@ -52,17 +56,3 @@ export const updateLetterheadSchema = z.object({
 
 export type UpdateLetterheadInput = z.infer<typeof updateLetterheadSchema>;
 
-// ---------- Quote prompt snippets (appended to the extraction prompt) ----------
-export const createQuotePromptSchema = z.object({
-  name: z.string().trim().min(1).max(150),
-  content: z.string().trim().min(1).max(20000),
-  enabled: z.coerce.boolean().optional(),
-});
-export type CreateQuotePromptInput = z.infer<typeof createQuotePromptSchema>;
-
-export const updateQuotePromptSchema = z.object({
-  name: z.string().trim().min(1).max(150).optional(),
-  content: z.string().trim().min(1).max(20000).optional(),
-  enabled: z.coerce.boolean().optional(),
-});
-export type UpdateQuotePromptInput = z.infer<typeof updateQuotePromptSchema>;

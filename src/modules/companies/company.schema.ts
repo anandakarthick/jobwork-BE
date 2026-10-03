@@ -26,9 +26,17 @@ export const listCompaniesSchema = z.object({
 
 export const idParamSchema = z.object({ id: z.coerce.number().int().positive() });
 
+/** `?brands=LK,ABB` — comma-separated brand names. */
+export const brandsQuerySchema = z.object({ brands: z.string().trim().max(2000).default('') });
+
 export const priceListDocParamsSchema = z.object({
   id: z.coerce.number().int().positive(),
   docId: z.coerce.number().int().positive(),
+});
+
+export const promptParamsSchema = z.object({
+  id: z.coerce.number().int().positive(),
+  promptId: z.coerce.number().int().positive(),
 });
 
 /** Body for renaming a brand file and/or switching its training on/off. */

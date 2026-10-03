@@ -7,6 +7,10 @@ export interface LlmConfig {
   openaiModel: string;
   anthropicApiKey: string;
   anthropicModel: string;
+  /** "database" = parsed price-list rows; "claude" = brand files read by Claude. */
+  quoteEngine: 'database' | 'claude';
+  /** Anthropic workspace id — required by the Files API with an org-wide key. */
+  anthropicWorkspaceId: string;
 }
 
 /**
@@ -22,5 +26,7 @@ export async function getEffectiveLlmConfig(): Promise<LlmConfig> {
     openaiModel: row?.openaiModel || env.llm.openaiModel,
     anthropicApiKey: row?.anthropicApiKey || env.llm.anthropicApiKey,
     anthropicModel: row?.anthropicModel || env.llm.anthropicModel,
+    quoteEngine: row?.quoteEngine === 'claude' ? 'claude' : 'database',
+    anthropicWorkspaceId: row?.anthropicWorkspaceId?.trim() || '',
   };
 }

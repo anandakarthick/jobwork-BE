@@ -18,7 +18,7 @@
  * Unit Rate = Catalog×(1−Disc%), Price = Unit Rate×Total Qty, Board price = Σ.
  */
 import ExcelJS from 'exceljs';
-import type { PricedLine } from './quote.pipeline';
+import { roleLabel, type PricedLine } from './quote.pipeline';
 
 export interface BomItem {
   description: string;
@@ -72,6 +72,36 @@ const BORDER: Partial<ExcelJS.Borders> = { top: THIN, left: THIN, bottom: THIN, 
  * (lamps, meter, MCB, SFU, review items) goes into a per-board "General" feeder.
  * Grouped by `board`. Do NOT pass consolidated lines — feeders would be lost.
  */
+/** The current rating named in a requirement ("630A", "63 A") — 0 when absent. */
+function ratingOf(requirement: string): number {
+  return Number(/(\d+)\s*A\b/i.exec(requirement)?.[1] ?? 0);
+}
+
+/**
+ * The short feeder label for a line: "<kind> <rating> A" (MCCB 630 A, MCB 63 A),
+ * falling back to the start of the BOQ wording when neither is recognisable.
+ */
+function feederBase(l: PricedLine): string {
+  const text = `${l.family ?? ''} ${l.requirement} ${l.description ?? ''}`;
+  const kind = /\bMCCB\b/i.test(text)
+    ? 'MCCB'
+    : /\bRCCB\b/i.test(text)
+      ? 'RCCB'
+      : /\bRCBO\b/i.test(text)
+        ? 'RCBO'
+        : /\bMCB\b/i.test(text)
+          ? 'MCB'
+          : /\bSFU\b|switch\s*fuse/i.test(text)
+            ? 'SFU'
+            : /\bACB\b/i.test(text)
+              ? 'ACB'
+              : null;
+  const rating = ratingOf(l.requirement);
+  if (kind && rating) return `${kind} ${rating} A`;
+  if (kind) return kind;
+  return l.requirement.slice(0, 40);
+}
+
 export function groupIntoBom(lines: PricedLine[]): BomBoard[] {
   const toItem = (l: PricedLine, qty: number): BomItem => ({
     description: l.description ?? l.requirement,
@@ -106,21 +136,38 @@ export function groupIntoBom(lines: PricedLine[]): BomBoard[] {
           if (a.lineRef != null) used.add(a.lineRef);
         }
       }
-      const rating = Number(/(\d+)\s*A\b/i.exec(m.requirement)?.[1] ?? 0);
-      const feeder = { name: rating ? `MCCB ${rating} A` : m.requirement.slice(0, 40), feederQty, items };
+      const rating = ratingOf(m.requirement);
+      // The feeder carries its BOQ role ("Incoming — MCCB 630 A") so the Excel says
+      // which feeders are incomers and which are outgoings.
+      const role = roleLabel(m.feederRole);
+      const base = feederBase(m);
+      const feeder = { name: role ? `${role} — ${base}` : base, feederQty, items };
       feeders.push(feeder);
       // The incomer = highest-rated MCCB in the board; panel-common items sit under it.
       if (!incomer || rating > incomer.rating) incomer = { feeder, rating };
     }
-    // Panel-level items that belong to no specific feeder (meter, CT, ELR, SPD,
-    // SFU, busbar) go UNDER the incomer feeder — as the reference BOM does — rather
-    // than a separate "General / Common" group.
+    // Lines that belong to no MCCB feeder. Panel-level items (meter, CT, ELR, SPD,
+    // SFU, busbar, lamps) go UNDER the incomer feeder — as the reference BOM does —
+    // rather than a separate "General / Common" group. But a line the BOQ labels
+    // OUTGOING (e.g. "63A 4P MCB" outgoing feeders) must not sit under the
+    // "Incoming" header: each becomes its own "Outgoing — MCB 63 A" feeder.
     const rest = bl.filter((l) => l.lineRef == null || !used.has(l.lineRef));
-    if (rest.length && incomer) {
+    const common = rest.filter((l) => l.feederRole !== 'outgoing');
+    const outgoing = rest.filter((l) => l.feederRole === 'outgoing');
+    if (common.length) {
+      if (!incomer) {
+        const feeder = { name: 'Incoming', feederQty: 1, items: [] as BomItem[] };
+        feeders.unshift(feeder);
+        incomer = { feeder, rating: 0 };
+      }
       const fq = incomer.feeder.feederQty || 1;
-      for (const l of rest) {
+      for (const l of common) {
         incomer.feeder.items.push(toItem(l, Math.max(1, Math.round((l.quantity || 1) / fq))));
       }
+    }
+    for (const l of outgoing) {
+      const feederQty = Math.max(1, Math.round(l.quantity || 1));
+      feeders.push({ name: `Outgoing — ${feederBase(l)}`, feederQty, items: [toItem(l, 1)] });
     }
     boards.push({ name: boardName, boardQty: 1, feeders });
   }

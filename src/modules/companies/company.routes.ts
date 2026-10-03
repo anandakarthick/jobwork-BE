@@ -4,12 +4,14 @@ import { requireAuth, requirePermission } from '../../middleware/auth';
 import { validate } from '../../middleware/validate';
 import { productUpload } from '../../middleware/upload';
 import {
+  brandsQuerySchema,
   createCompanySchema,
   idParamSchema,
   listCompaniesSchema,
   parseFileNames,
   parseTrainFlags,
   priceListDocParamsSchema,
+  promptParamsSchema,
   savePromptsSchema,
   statusBodySchema,
   updateCompanySchema,
@@ -17,10 +19,26 @@ import {
 } from './company.schema';
 import * as companyService from './company.service';
 import type { StoredFile } from './company.service';
+import { trainBrandIntoClaude, trainBrandRulesIntoClaude } from './knowledge.service';
 
 export const companyRouter = Router();
 
 companyRouter.use(requireAuth);
+
+// Keyword prompts of several brands by name (?brands=LK,ABB) — the rule picker
+// on Get Quote. Declared before the '/:id' routes so "prompts" isn't taken as an id.
+companyRouter.get(
+  '/prompts',
+  requirePermission('jobwork.view'),
+  validate(brandsQuerySchema, 'query'),
+  asyncHandler(async (req, res) => {
+    const brands = String(req.query.brands ?? '')
+      .split(',')
+      .map((b) => b.trim())
+      .filter(Boolean);
+    res.json(await companyService.listPromptsForBrands(brands));
+  }),
+);
 
 // ----- Brand (company) price-list documents -----
 companyRouter.get(
@@ -58,6 +76,29 @@ companyRouter.post(
   }),
 );
 
+// Train one file into Claude (Files API) — knowledge-in-Claude engine.
+companyRouter.post(
+  '/:id/price-lists/:docId/train-claude',
+  requirePermission('companies.edit'),
+  validate(priceListDocParamsSchema, 'params'),
+  asyncHandler(async (req, res) => {
+    res.status(202).json(
+      await companyService.trainPriceListIntoClaude(Number(req.params.id), Number(req.params.docId)),
+    );
+  }),
+);
+
+// Train every ticked file of the brand into Claude.
+companyRouter.post(
+  '/:id/train-claude',
+  requirePermission('companies.edit'),
+  validate(idParamSchema, 'params'),
+  asyncHandler(async (req, res) => {
+    const count = await trainBrandIntoClaude(Number(req.params.id));
+    res.status(202).json({ started: count });
+  }),
+);
+
 // Rename one file and/or switch its training on/off.
 companyRouter.patch(
   '/:id/price-lists/:docId',
@@ -82,6 +123,28 @@ companyRouter.get(
   validate(idParamSchema, 'params'),
   asyncHandler(async (req, res) => {
     res.json(await companyService.listPrompts(Number(req.params.id)));
+  }),
+);
+
+// Train every rule of the brand into Claude (declared before '/:id/prompts/:promptId').
+companyRouter.post(
+  '/:id/prompts/train-claude',
+  requirePermission('companies.edit'),
+  validate(idParamSchema, 'params'),
+  asyncHandler(async (req, res) => {
+    res.status(202).json({ started: await trainBrandRulesIntoClaude(Number(req.params.id)) });
+  }),
+);
+
+// Train one rule into Claude.
+companyRouter.post(
+  '/:id/prompts/:promptId/train-claude',
+  requirePermission('companies.edit'),
+  validate(promptParamsSchema, 'params'),
+  asyncHandler(async (req, res) => {
+    res
+      .status(202)
+      .json(await companyService.trainPromptIntoClaude(Number(req.params.id), Number(req.params.promptId)));
   }),
 );
 
