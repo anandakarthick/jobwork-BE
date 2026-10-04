@@ -8,3 +8,6 @@ uploads/
 
 # Python OCR helper cache
 scripts/__pycache__/
+
+# local archives
+*.zip
