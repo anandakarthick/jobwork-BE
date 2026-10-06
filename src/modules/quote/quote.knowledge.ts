@@ -158,20 +158,30 @@ function normaliseBoards(raw: unknown): KnowledgeBoard[] {
           const feeder = (f ?? {}) as Partial<KnowledgeFeeder>;
           const items = (Array.isArray(feeder.items) ? feeder.items : [])
             .map((i) => {
-              const it = (i ?? {}) as Partial<KnowledgeItem>;
+              // The model may echo the Excel/BOM field names (modelNo, catalogPrice,
+              // reason) instead of ours — accept both so a chat change never loses codes.
+              const it = (i ?? {}) as Partial<KnowledgeItem> & {
+                modelNo?: unknown;
+                catalogPrice?: unknown;
+                price?: unknown;
+                reason?: unknown;
+                quantity?: unknown;
+              };
               const requirement = String(it.requirement ?? it.description ?? '').trim().slice(0, 500);
               if (!requirement && !it.description) return null;
+              const code = it.catalogNo ?? it.modelNo;
+              const price = it.listPrice ?? it.catalogPrice ?? it.price;
               return {
                 requirement: requirement || String(it.description ?? '').slice(0, 500),
                 description: String(it.description ?? requirement).trim().slice(0, 500),
-                catalogNo: it.catalogNo != null && String(it.catalogNo).trim() ? String(it.catalogNo).trim().slice(0, 120) : null,
+                catalogNo: code != null && String(code).trim() ? String(code).trim().slice(0, 120) : null,
                 make: String(it.make ?? '').trim().slice(0, 80),
                 series: it.series != null ? String(it.series).slice(0, 40) : null,
                 releaseModel: it.releaseModel != null ? String(it.releaseModel).slice(0, 40) : null,
-                qty: num(it.qty, 1),
-                listPrice: it.listPrice != null && Number.isFinite(Number(it.listPrice)) ? Number(it.listPrice) : null,
+                qty: num(it.qty ?? it.quantity, 1),
+                listPrice: price != null && price !== '' && Number.isFinite(Number(price)) ? Number(price) : null,
                 isAccessory: Boolean(it.isAccessory),
-                note: String(it.note ?? '').trim().slice(0, 1000),
+                note: String(it.note ?? it.reason ?? '').trim().slice(0, 1000),
               } satisfies KnowledgeItem;
             })
             .filter((x): x is KnowledgeItem => x !== null);
@@ -331,11 +341,31 @@ export async function chatWithKnowledge(input: ChatInput): Promise<ChatResult> {
   }
   const files = await requireKnowledgeFiles(input.brands);
   const system = await getPromptText('quote.knowledge.chat');
+  // Hand the current BOM over in the SAME field names the answer must use
+  // (catalogNo / listPrice / qty / note), so an updated BOM comes back in the
+  // shape the code reads — the Excel's modelNo / catalogPrice names stay internal.
+  const current = (input.currentBoards ?? []).map((b) => ({
+    name: b.name,
+    boardQty: b.boardQty,
+    feeders: b.feeders.map((f) => ({
+      name: f.name,
+      feederQty: f.feederQty,
+      items: f.items.map((it) => ({
+        requirement: it.description,
+        description: it.description,
+        catalogNo: it.modelNo,
+        make: it.make ?? '',
+        qty: it.qty,
+        listPrice: it.catalogPrice,
+        note: '',
+      })),
+    })),
+  }));
   const context =
     `CUSTOMER: ${input.customerName}\nBRANDS: ${input.brands.join(', ')}\n\n` +
     (input.ruleFileIds.length ? `BRAND RULES: ${input.ruleFileIds.length} rule file(s) are attached after the price lists.\n` : '') +
     (input.rulesText.trim() ? `BRAND RULES (text):\n${input.rulesText.trim()}\n\n` : '\n') +
-    `CURRENT BOM:\n${JSON.stringify(input.currentBoards ?? [])}`;
+    `CURRENT BOM (items carry: requirement, description, catalogNo, make, qty, listPrice, note):\n${JSON.stringify(current)}`;
   // The files + context open the conversation; the stored chat follows; the new
   // message closes it.
   const messages: LlmMessage[] = [
