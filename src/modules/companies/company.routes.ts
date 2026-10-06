@@ -150,6 +150,17 @@ companyRouter.post(
   }),
 );
 
+// Give the brand's ungrouped rules a group of their own (brand view page).
+companyRouter.post(
+  '/:id/rule-groups',
+  requirePermission('companies.edit'),
+  validate(idParamSchema, 'params'),
+  validate(renameRuleGroupSchema),
+  asyncHandler(async (req, res) => {
+    res.status(201).json(await companyService.groupUngroupedRules(Number(req.params.id), req.body));
+  }),
+);
+
 // Rename one rule group in place (brand view page).
 companyRouter.patch(
   '/:id/rule-groups/:groupId',

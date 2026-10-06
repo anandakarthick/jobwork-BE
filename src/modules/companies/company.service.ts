@@ -313,6 +313,24 @@ export async function listPrompts(companyId: number) {
   return { groups, prompts };
 }
 
+/**
+ * Turn the brand's ungrouped rules (made before groups existed) into a named
+ * group: creates the group at the end and moves every ungrouped rule into it.
+ */
+export async function groupUngroupedRules(companyId: number, input: RenameRuleGroupInput) {
+  await ensureCompany(companyId);
+  const clash = await prisma.brandRuleGroup.findFirst({ where: { companyId, name: input.name }, select: { id: true } });
+  if (clash) throw HttpError.badRequest(`A group named "${input.name}" already exists on this brand`);
+  const last = await prisma.brandRuleGroup.aggregate({ where: { companyId }, _max: { sortOrder: true } });
+  await prisma.$transaction(async (tx) => {
+    const group = await tx.brandRuleGroup.create({
+      data: { companyId, name: input.name, sortOrder: (last._max.sortOrder ?? -1) + 1 },
+    });
+    await tx.brandPrompt.updateMany({ where: { companyId, groupId: null }, data: { groupId: group.id } });
+  });
+  return listPrompts(companyId);
+}
+
 /** Rename one group without touching the rest of the tree; returns the group list. */
 export async function renameRuleGroup(companyId: number, groupId: number, input: RenameRuleGroupInput) {
   const group = await prisma.brandRuleGroup.findFirst({ where: { id: groupId, companyId } });
