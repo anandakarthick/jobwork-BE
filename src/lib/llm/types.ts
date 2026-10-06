@@ -61,6 +61,8 @@ export interface CompleteOptions {
   maxTokens?: number;
   /** Optional tag recorded with usage metering (e.g. "quote:extract"). */
   label?: string;
+  /** "fast" runs the provider's cheap model (small jobs); default = main model. */
+  tier?: 'main' | 'fast';
 }
 
 /**

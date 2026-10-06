@@ -8,6 +8,7 @@ export const updateLlmSchema = z.object({
   quoteEngine: z.enum(['database', 'claude']).optional(),
   // Anthropic workspace id ("wrkspc_…"); empty string clears it.
   anthropicWorkspaceId: z.string().trim().max(80).optional(),
+  anthropicFastModel: z.string().trim().min(1).max(80).optional(),
   // Keys: provide a value to set; omit or leave empty to keep the current one.
   openaiApiKey: z.string().max(500).optional(),
   anthropicApiKey: z.string().max(500).optional(),

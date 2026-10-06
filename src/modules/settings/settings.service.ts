@@ -127,6 +127,7 @@ export async function getLlmSettings() {
     anthropicModel: row?.anthropicModel ?? 'claude-opus-4-8',
     quoteEngine: (row?.quoteEngine as 'database' | 'claude' | undefined) ?? 'database',
     anthropicWorkspaceId: row?.anthropicWorkspaceId ?? '',
+    anthropicFastModel: row?.anthropicFastModel ?? 'claude-haiku-4-5-20251001',
     openaiKeySet: Boolean(row?.openaiApiKey),
     anthropicKeySet: Boolean(row?.anthropicApiKey),
     openaiBalance: row?.openaiBalance != null ? Number(row.openaiBalance) : null,
@@ -183,6 +184,7 @@ export async function updateLlmSettings(input: UpdateLlmInput) {
   if (input.anthropicModel !== undefined) update.anthropicModel = input.anthropicModel;
   if (input.quoteEngine !== undefined) update.quoteEngine = input.quoteEngine;
   if (input.anthropicWorkspaceId !== undefined) update.anthropicWorkspaceId = input.anthropicWorkspaceId || null;
+  if (input.anthropicFastModel !== undefined) update.anthropicFastModel = input.anthropicFastModel;
   // Setting a balance resets its "as of" instant, so spend is counted from now.
   if (input.openaiBalance !== undefined) {
     update.openaiBalance = input.openaiBalance;
@@ -210,6 +212,7 @@ export async function updateLlmSettings(input: UpdateLlmInput) {
       anthropicModel: input.anthropicModel ?? 'claude-opus-4-8',
       quoteEngine: input.quoteEngine ?? 'database',
       anthropicWorkspaceId: input.anthropicWorkspaceId || null,
+      anthropicFastModel: input.anthropicFastModel ?? 'claude-haiku-4-5-20251001',
       openaiApiKey: input.clearOpenaiKey ? null : input.openaiApiKey || null,
       anthropicApiKey: input.clearAnthropicKey ? null : input.anthropicApiKey || null,
     },

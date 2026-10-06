@@ -147,6 +147,8 @@ const priceListSelect = {
   aiTrainedAt: true,
   aiFileKind: true,
   aiPages: true,
+  aiIndexedAt: true,
+  aiSectionCount: true,
 } satisfies Prisma.ProductDocumentSelect;
 
 /** True when Get Quote runs on files trained into Claude (Settings → API Keys). */

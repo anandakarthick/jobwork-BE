@@ -8,7 +8,8 @@
  */
 import { prisma } from '../../lib/prisma';
 import { HttpError } from '../../lib/http-error';
-import { getEffectiveLlmConfig } from '../../lib/llm';
+import { getEffectiveLlmConfig, getLlmProvider, type LlmProvider } from '../../lib/llm';
+import { getPromptText } from '../prompts/prompt.service';
 import { PDFDocument } from 'pdf-lib';
 import { readFile } from 'fs/promises';
 import {
@@ -113,11 +114,199 @@ async function runClaudeTraining(documentId: number): Promise<void> {
         aiTrainedAt: new Date(),
       },
     });
+
+    // Read the price list ONCE more — by Claude — into a compact catalogue index,
+    // one file per section. Quotes attach the sections a BOQ needs instead of the
+    // whole text, which is what makes each quote cheap. The full text stays as the
+    // fallback when a file has no index.
+    try {
+      const sections = await buildCatalogueIndex(documentId, text, auth);
+      await prisma.productDocument.update({
+        where: { id: documentId },
+        data: { aiIndexedAt: sections ? new Date() : null, aiSectionCount: sections },
+      });
+    } catch (err) {
+      console.warn('[knowledge] catalogue index failed for document', documentId, explainAnthropicError(err));
+      await prisma.productDocument.update({
+        where: { id: documentId },
+        data: { aiIndexedAt: null, aiSectionCount: 0 },
+      });
+    }
   } catch (err) {
     await prisma.productDocument.update({
       where: { id: documentId },
       data: { aiStatus: 'FAILED', aiError: explainAnthropicError(err).slice(0, 2000) },
     });
+  }
+}
+
+// ---------- Catalogue index (sections) ----------
+
+/** Characters of price-list text per indexing request (≈ 15–20k tokens). */
+const INDEX_CHUNK_CHARS = 60_000;
+
+/** Strip ``` fences and parse a JSON value the model returned. */
+function parseJson<T>(raw: string): T {
+  const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
+  const start = cleaned.search(/[[{]/);
+  return JSON.parse(start > 0 ? cleaned.slice(start) : cleaned) as T;
+}
+
+/** Split the trained text into chunks on page boundaries, each ≤ max chars. */
+function chunkByPages(text: string, max: number): string[] {
+  const pages = text.split(/(?=^\[page \d+\]$)/m);
+  const chunks: string[] = [];
+  let cur = '';
+  for (const p of pages) {
+    if (cur && cur.length + p.length > max) {
+      chunks.push(cur);
+      cur = '';
+    }
+    if (p.length > max) {
+      // A single huge page: cut it hard.
+      for (let i = 0; i < p.length; i += max) chunks.push(p.slice(i, i + max));
+      continue;
+    }
+    cur += p;
+  }
+  if (cur.trim()) chunks.push(cur);
+  return chunks;
+}
+
+/**
+ * Build the catalogue index of one trained file: Claude reads the text chunk by
+ * chunk and returns products grouped by the price list's own sections; the
+ * sections are merged across chunks, uploaded to Claude one file each, and their
+ * ids kept. Returns the number of sections stored.
+ */
+async function buildCatalogueIndex(documentId: number, text: string, auth: AnthropicAuth): Promise<number> {
+  const doc = await prisma.productDocument.findUnique({ where: { id: documentId } });
+  if (!doc) return 0;
+  const provider = await getLlmProvider();
+  if (!provider.completeWithKnowledge) return 0;
+  const system = await getPromptText('knowledge.index.system');
+  const label = `${doc.brand ?? ''} — ${doc.name || doc.fileName}`;
+
+  type Section = { name: string; keywords: Set<string>; lines: string[] };
+  const merged = new Map<string, Section>();
+  const chunks = chunkByPages(text, INDEX_CHUNK_CHARS);
+  for (const [i, chunk] of chunks.entries()) {
+    const raw = await provider.completeWithKnowledge(
+      {
+        fileIds: [],
+        messages: [{ role: 'user', content: `PRICE LIST: ${label} (part ${i + 1} of ${chunks.length})\n\n${chunk}` }],
+      },
+      { system, json: true, label: 'knowledge:index' },
+    );
+    const parsed = parseJson<{ sections?: { name?: unknown; keywords?: unknown; lines?: unknown }[] }>(raw);
+    for (const s of parsed.sections ?? []) {
+      const name = String(s.name ?? '').trim().slice(0, 190);
+      if (!name) continue;
+      const key = name.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      const entry = merged.get(key) ?? { name, keywords: new Set<string>(), lines: [] };
+      if (Array.isArray(s.keywords)) for (const k of s.keywords) entry.keywords.add(String(k).toLowerCase().trim());
+      if (Array.isArray(s.lines)) for (const l of s.lines) if (String(l).trim()) entry.lines.push(String(l).trim());
+      merged.set(key, entry);
+    }
+  }
+
+  // Replace the previous index of this file (files in Claude + rows).
+  const old = await prisma.knowledgeSection.findMany({ where: { documentId }, select: { aiFileId: true } });
+  for (const o of old) await deleteKnowledgeFile(auth, o.aiFileId).catch(() => undefined);
+  await prisma.knowledgeSection.deleteMany({ where: { documentId } });
+
+  let count = 0;
+  for (const s of merged.values()) {
+    const lines = [...new Set(s.lines)];
+    if (!lines.length) continue;
+    const body =
+      `BRAND: ${doc.brand ?? ''}\nFILE: ${doc.name || doc.fileName}\nSECTION: ${s.name}\n` +
+      'Catalogue index — one product per line: catalogue number | description | price.\n\n' +
+      lines.join('\n') +
+      '\n';
+    const uploaded = await uploadKnowledgeText(
+      auth,
+      knowledgeFileName(doc.brand ?? 'brand', `${doc.name || doc.fileName} — ${s.name}`, doc.fileName),
+      body,
+    );
+    await prisma.knowledgeSection.create({
+      data: {
+        documentId,
+        name: s.name,
+        keywords: [...s.keywords].filter(Boolean).join(', ').slice(0, 60_000),
+        aiFileId: uploaded.id,
+        chars: body.length,
+        lineCount: lines.length,
+      },
+    });
+    count++;
+  }
+  return count;
+}
+
+export interface KnowledgeSectionInfo {
+  id: number;
+  documentId: number;
+  brand: string;
+  name: string;
+  keywords: string;
+  aiFileId: string;
+  lineCount: number;
+}
+
+/** Every catalogue section of the brands' trained files. */
+export async function knowledgeSectionsForBrands(brands: string[]): Promise<KnowledgeSectionInfo[]> {
+  if (!brands.length) return [];
+  const rows = await prisma.knowledgeSection.findMany({
+    where: {
+      document: { brand: { in: brands }, kind: 'PRICE_LIST', train: true, aiStatus: { in: ['COMPLETED', 'PROCESSING'] } },
+    },
+    include: { document: { select: { brand: true } } },
+    orderBy: [{ documentId: 'asc' }, { id: 'asc' }],
+  });
+  return rows.map((r) => ({
+    id: r.id,
+    documentId: r.documentId,
+    brand: r.document.brand ?? '',
+    name: r.name,
+    keywords: r.keywords,
+    aiFileId: r.aiFileId,
+    lineCount: r.lineCount,
+  }));
+}
+
+/**
+ * Ask the FAST model which sections a BOQ needs. Returns the chosen ids, or every
+ * id when the pick fails or comes back empty — a missing section is the one
+ * mistake that would hide products, so the fallback is "all".
+ */
+export async function selectSectionsForBoq(
+  provider: LlmProvider,
+  boqText: string,
+  sections: KnowledgeSectionInfo[],
+): Promise<{ ids: number[]; partial: boolean }> {
+  const all = sections.map((s) => s.id);
+  if (!provider.completeWithKnowledge || sections.length <= 2) return { ids: all, partial: false };
+  try {
+    const system = await getPromptText('knowledge.select.system');
+    const list = sections
+      .map((s) => `${s.id} | ${s.brand} | ${s.name} | ${s.lineCount} products | ${s.keywords.slice(0, 300)}`)
+      .join('\n');
+    const raw = await provider.completeWithKnowledge(
+      {
+        fileIds: [],
+        messages: [{ role: 'user', content: `AVAILABLE SECTIONS (id | brand | name | size | keywords):\n${list}\n\nBOQ:\n${boqText.slice(0, 60_000)}` }],
+      },
+      { system, json: true, maxTokens: 2000, label: 'knowledge:select', tier: 'fast' },
+    );
+    const parsed = parseJson<{ sectionIds?: unknown }>(raw);
+    const ids = Array.isArray(parsed.sectionIds)
+      ? parsed.sectionIds.map((v) => Number(v)).filter((n) => all.includes(n))
+      : [];
+    if (!ids.length) return { ids: all, partial: false };
+    return { ids: [...new Set(ids)], partial: ids.length < all.length };
+  } catch {
+    return { ids: all, partial: false };
   }
 }
 
@@ -135,16 +324,17 @@ export async function trainBrandIntoClaude(companyId: number): Promise<number> {
 export async function forgetClaudeFile(documentId: number): Promise<void> {
   const doc = await prisma.productDocument.findUnique({
     where: { id: documentId },
-    select: { aiFileId: true, aiTextFileId: true },
+    select: { aiFileId: true, aiTextFileId: true, sections: { select: { aiFileId: true } } },
   });
-  if (!doc?.aiFileId && !doc?.aiTextFileId) return;
+  if (!doc) return;
   const cfg = await getEffectiveLlmConfig();
   if (cfg.anthropicApiKey) {
     const auth = { apiKey: cfg.anthropicApiKey, workspaceId: cfg.anthropicWorkspaceId || undefined };
-    for (const id of [doc.aiFileId, doc.aiTextFileId]) {
+    for (const id of [doc.aiFileId, doc.aiTextFileId, ...doc.sections.map((s) => s.aiFileId)]) {
       if (id) await deleteKnowledgeFile(auth, id).catch(() => undefined);
     }
   }
+  await prisma.knowledgeSection.deleteMany({ where: { documentId } });
   await prisma.productDocument.update({
     where: { id: documentId },
     data: {
@@ -155,6 +345,8 @@ export async function forgetClaudeFile(documentId: number): Promise<void> {
       aiStatus: 'NOT_STARTED',
       aiTrainedAt: null,
       aiFileChars: null,
+      aiIndexedAt: null,
+      aiSectionCount: null,
     },
   });
 }

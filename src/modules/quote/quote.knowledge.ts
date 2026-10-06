@@ -16,7 +16,13 @@
 import type { LlmMessage, LlmProvider } from '../../lib/llm';
 import { HttpError } from '../../lib/http-error';
 import { getPromptText } from '../prompts/prompt.service';
-import { knowledgeFilesForBrands, selectKnowledgeFileIds, transientBrandText } from '../companies/knowledge.service';
+import {
+  knowledgeFilesForBrands,
+  knowledgeSectionsForBrands,
+  selectKnowledgeFileIds,
+  selectSectionsForBoq,
+  transientBrandText,
+} from '../companies/knowledge.service';
 import type { BomBoard } from './quote.bom';
 
 export interface KnowledgeItem {
@@ -70,6 +76,8 @@ export interface KnowledgeResult {
   total: number;
   /** Items whose code/price could not be found in the files (voided). */
   voided: string[];
+  /** Catalogue sections attached for this run (null = full files / all sections). */
+  sectionIds: number[] | null;
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
@@ -258,7 +266,46 @@ async function finishBoards(
   const { bom, lines } = toQuoteShape(boards, defaultDiscountPct);
   const total = lines.length;
   const matched = lines.filter((l) => l.catalogNo).length;
-  return { boards: bom, lines, summary, matched, total, voided };
+  return { boards: bom, lines, summary, matched, total, voided, sectionIds: null };
+}
+
+/**
+ * What to attach for the brands: the catalogue-index sections a BOQ needs (picked
+ * by the fast model, or the given ids), falling back to the full text files when
+ * a file has no index yet. `partial` = fewer than all sections were attached.
+ */
+async function attachmentsFor(
+  provider: LlmProvider,
+  brands: string[],
+  files: Awaited<ReturnType<typeof knowledgeFilesForBrands>>,
+  boqText: string,
+  sectionIds: number[] | null | undefined,
+): Promise<{ fileIds: string[]; sectionIds: number[] | null; partial: boolean; detail: string }> {
+  const sections = await knowledgeSectionsForBrands(brands);
+  const indexedDocs = new Set(sections.map((s) => s.documentId));
+  // Files without an index are attached whole.
+  const whole = selectKnowledgeFileIds(files.filter((f) => !indexedDocs.has(f.id))).fileIds;
+  if (!sections.length) return { fileIds: whole, sectionIds: null, partial: false, detail: `${whole.length} price-list file(s)` };
+
+  let ids: number[];
+  let partial: boolean;
+  if (sectionIds && sectionIds.length) {
+    ids = sectionIds.filter((id) => sections.some((s) => s.id === id));
+    partial = ids.length < sections.length;
+    if (!ids.length) {
+      ids = sections.map((s) => s.id);
+      partial = false;
+    }
+  } else {
+    ({ ids, partial } = await selectSectionsForBoq(provider, boqText, sections));
+  }
+  const chosen = sections.filter((s) => ids.includes(s.id));
+  return {
+    fileIds: [...chosen.map((s) => s.aiFileId), ...whole],
+    sectionIds: partial ? ids : null,
+    partial,
+    detail: `${chosen.length} of ${sections.length} catalogue section(s)${whole.length ? ` + ${whole.length} full file(s)` : ''}`,
+  };
 }
 
 export interface GenerateInput {
@@ -272,6 +319,8 @@ export interface GenerateInput {
   boqText: string;
   customerName: string;
   defaultDiscountPct: number;
+  /** Reuse a previous run's section pick (chat regeneration); omit to pick afresh. */
+  sectionIds?: number[] | null;
   onProgress?: (stage: 'collect' | 'extract' | 'assemble', detail: string) => void;
 }
 
@@ -280,8 +329,33 @@ export async function generateWithKnowledge(input: GenerateInput): Promise<Knowl
   if (!input.provider.completeWithKnowledge) {
     throw HttpError.badRequest('The Claude knowledge engine needs the Claude provider (Settings → API Keys).');
   }
-  input.onProgress?.('collect', 'Attaching the brand files trained into Claude');
+  input.onProgress?.('collect', 'Choosing the catalogue sections this BOQ needs');
   const files = await requireKnowledgeFiles(input.brands);
+  const attach = await attachmentsFor(input.provider, input.brands, files, input.boqText, input.sectionIds);
+  const result = await generateOnce(input, files, attach.fileIds, attach.detail);
+  result.sectionIds = attach.sectionIds;
+  // Safety net: if only some sections were attached and many lines came back
+  // unpriced, the pick probably missed a section — run once more with everything.
+  const unpriced = result.total - result.matched;
+  if (attach.partial && result.total > 0 && unpriced / result.total > 0.3) {
+    const all = await attachmentsFor(input.provider, input.brands, files, input.boqText, null);
+    const allIds = (await knowledgeSectionsForBrands(input.brands)).map((s) => s.id);
+    const full = await attachmentsFor(input.provider, input.brands, files, input.boqText, allIds);
+    const retry = await generateOnce(input, files, (full.fileIds.length ? full : all).fileIds, 'all catalogue sections (retry)');
+    if (retry.matched > result.matched) {
+      retry.sectionIds = null;
+      return retry;
+    }
+  }
+  return result;
+}
+
+async function generateOnce(
+  input: GenerateInput,
+  files: Awaited<ReturnType<typeof knowledgeFilesForBrands>>,
+  fileIds: string[],
+  attachDetail: string,
+): Promise<KnowledgeResult> {
   const system = await getPromptText('quote.knowledge.system');
   const ruleNote =
     input.ruleFileIds.length || input.rulesText.trim()
@@ -295,10 +369,10 @@ export async function generateWithKnowledge(input: GenerateInput): Promise<Knowl
     (input.customerNotes.trim() ? `CUSTOMER MESSAGE:\n${input.customerNotes.trim()}\n\n` : '') +
     `BOQ (bill of quantities):\n${input.boqText.slice(0, 160_000)}\n\n` +
     'Produce the complete JSON described in your instructions.';
-  input.onProgress?.('extract', `Claude is reading ${files.length} price-list file(s), ${input.ruleFileIds.length} rule file(s) and the BOQ`);
-  const raw = await input.provider.completeWithKnowledge(
-    { fileIds: [...selectKnowledgeFileIds(files).fileIds, ...input.ruleFileIds], messages: [{ role: 'user', content: user }] },
-    { system, json: true, maxTokens: 24000, label: 'quote:knowledge' },
+  input.onProgress?.('extract', `Claude is reading ${attachDetail}, ${input.ruleFileIds.length} rule file(s) and the BOQ`);
+  const raw = await input.provider.completeWithKnowledge!(
+    { fileIds: [...fileIds, ...input.ruleFileIds], messages: [{ role: 'user', content: user }] },
+    { system, json: true, label: 'quote:knowledge' },
   );
   const parsed = parseJson<{ summary?: string; boards?: unknown }>(raw);
   input.onProgress?.('assemble', 'Verifying every code and price against the brand files');
@@ -315,6 +389,8 @@ export interface ChatInput {
   history: LlmMessage[];
   message: string;
   defaultDiscountPct: number;
+  /** The sections the quote was generated with (reused for the chat). */
+  sectionIds?: number[] | null;
 }
 
 export interface ChatResult {
@@ -322,6 +398,29 @@ export interface ChatResult {
   fileName: string | null;
   /** Present when the model changed the BOM (already verified). */
   result: KnowledgeResult | null;
+  /** "question" was answered by the fast model; "change" by the main model. */
+  kind: 'question' | 'change';
+}
+
+/** Fast-model triage: does the message ask for information or for a change? */
+async function classifyMessage(provider: LlmProvider, message: string, history: LlmMessage[]): Promise<'question' | 'change'> {
+  if (!provider.completeWithKnowledge) return 'change';
+  // Obvious change words skip the call.
+  if (/\b(change|replace|swap|switch|remove|delete|add|increase|decrease|set|make|update|rename|regenerate|discount|qty|quantity|instead)\b/i.test(message)) {
+    return 'change';
+  }
+  try {
+    const system = await getPromptText('knowledge.classify.system');
+    const recent = history.slice(-4).map((m) => `${m.role}: ${m.content.slice(0, 300)}`).join('\n');
+    const raw = await provider.completeWithKnowledge(
+      { fileIds: [], messages: [{ role: 'user', content: `RECENT CHAT:\n${recent}\n\nLATEST MESSAGE:\n${message}` }] },
+      { system, json: true, maxTokens: 200, label: 'knowledge:classify', tier: 'fast' },
+    );
+    const parsed = parseJson<{ kind?: string }>(raw);
+    return parsed.kind === 'question' ? 'question' : 'change';
+  } catch {
+    return 'change';
+  }
 }
 
 /** A follow-up message: answer, or the complete updated (verified) BOM. */
@@ -330,6 +429,9 @@ export async function chatWithKnowledge(input: ChatInput): Promise<ChatResult> {
     throw HttpError.badRequest('The Claude knowledge engine needs the Claude provider (Settings → API Keys).');
   }
   const files = await requireKnowledgeFiles(input.brands);
+  // Questions go to the fast model (cheap); changes need the main model.
+  const kind = await classifyMessage(input.provider, input.message, input.history);
+  const attach = await attachmentsFor(input.provider, input.brands, files, input.message, input.sectionIds);
   const system = await getPromptText('quote.knowledge.chat');
   const context =
     `CUSTOMER: ${input.customerName}\nBRANDS: ${input.brands.join(', ')}\n\n` +
@@ -345,14 +447,22 @@ export async function chatWithKnowledge(input: ChatInput): Promise<ChatResult> {
     { role: 'user', content: input.message },
   ];
   const raw = await input.provider.completeWithKnowledge(
-    { fileIds: [...selectKnowledgeFileIds(files).fileIds, ...input.ruleFileIds], messages },
-    { system, json: true, maxTokens: 24000, label: 'quote:knowledge-chat' },
+    { fileIds: [...attach.fileIds, ...input.ruleFileIds], messages },
+    {
+      system,
+      json: true,
+      label: kind === 'question' ? 'quote:knowledge-question' : 'quote:knowledge-chat',
+      tier: kind === 'question' ? 'fast' : 'main',
+      ...(kind === 'question' ? { maxTokens: 3000 } : {}),
+    },
   );
   const parsed = parseJson<{ reply?: string; bom?: unknown; fileName?: string | null }>(raw);
   const reply = String(parsed.reply ?? '').trim().slice(0, 2000);
+  // A question never changes the quote, whatever the model returned.
   const result =
-    Array.isArray(parsed.bom) && parsed.bom.length
+    kind === 'change' && Array.isArray(parsed.bom) && parsed.bom.length
       ? await finishBoards(parsed.bom, files, input.defaultDiscountPct, reply)
       : null;
-  return { reply, fileName: parsed.fileName ? String(parsed.fileName) : null, result };
+  if (result) result.sectionIds = attach.sectionIds;
+  return { reply, fileName: parsed.fileName ? String(parsed.fileName) : null, result, kind };
 }

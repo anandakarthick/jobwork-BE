@@ -1,4 +1,4 @@
-import type { Prisma, PriceListItem } from '@prisma/client';
+import { Prisma, type PriceListItem } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { rankCandidates } from '../price-list/price-list.retrieval';
 import { HttpError } from '../../lib/http-error';
@@ -323,9 +323,18 @@ async function saveKnowledgeResult(quoteId: number, provider: string, result: Kn
         error: null,
         summary: `Matched ${result.matched}/${result.total} lines.`,
         bomJson: result.boards as unknown as Prisma.InputJsonValue,
+        // The catalogue sections this run used — chat follow-ups attach the same.
+        knowledgeSectionIds: result.sectionIds ?? Prisma.JsonNull,
       },
     }),
   ]);
+}
+
+/** The section ids stored on a quote, or null for "all / full files". */
+function quoteSectionIds(quote: { knowledgeSectionIds: Prisma.JsonValue | null }): number[] | null {
+  return Array.isArray(quote.knowledgeSectionIds)
+    ? quote.knowledgeSectionIds.filter((v): v is number => typeof v === 'number')
+    : null;
 }
 
 /** The reply that opens / follows a knowledge-engine generation. */
@@ -1047,6 +1056,8 @@ export async function addQuoteMessage(
           boqText,
           customerName: quote.customer.name,
           defaultDiscountPct: 0,
+          // A new BOQ needs a fresh section pick; a plain "regenerate" reuses the last.
+          sectionIds: attachments.length ? null : quoteSectionIds(quote),
           onProgress: (stage, detail) => setProgress(quoteId, stage, detail),
         });
         setProgress(quoteId, 'save', `Saving ${result.lines.length} line(s) and the BOM`);
@@ -1070,6 +1081,7 @@ export async function addQuoteMessage(
         history: quote.messages.map((m) => ({ role: m.role.toLowerCase() as LlmMessage['role'], content: m.content })),
         message: content || (attachments.length ? '(see attached files)' : ''),
         defaultDiscountPct: 0,
+        sectionIds: quoteSectionIds(quote),
       });
       let changed = false;
       const dl = chat.fileName ? safeName(chat.fileName) : null;

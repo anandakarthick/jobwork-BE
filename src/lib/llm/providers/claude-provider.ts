@@ -156,16 +156,24 @@ export function createClaudeProvider(cfg: LlmConfig): LlmProvider {
         : '';
       const systemText = (opts.system ?? '') + jsonHint;
 
+      // Cached for an HOUR (extended TTL): the brand files are the bulk of every
+      // request and price lists change rarely, so quotes made within the hour read
+      // them at 10% of the price instead of paying the full read each time.
+      const cache = { type: 'ephemeral' as const, ttl: '1h' as const };
+      const model = opts.tier === 'fast' ? cfg.anthropicFastModel : cfg.anthropicModel;
+
       const turns = input.messages.filter((m) => m.role !== 'system');
       const firstUser = turns.findIndex((m) => m.role === 'user');
       const messages: Anthropic.Beta.Messages.BetaMessageParam[] = turns.map((m, i) => {
-        if (i !== firstUser) return { role: m.role as 'user' | 'assistant', content: m.content };
+        if (i !== firstUser || input.fileIds.length === 0) {
+          return { role: m.role as 'user' | 'assistant', content: m.content };
+        }
         // Files + the first user text. Cache breakpoint on the last file so the
         // whole file prefix is cached (max 4 breakpoints: system + here is enough).
         const files: Anthropic.Beta.Messages.BetaContentBlockParam[] = input.fileIds.map((id, k) => ({
           type: 'document' as const,
           source: { type: 'file' as const, file_id: id },
-          ...(k === input.fileIds.length - 1 ? { cache_control: { type: 'ephemeral' as const } } : {}),
+          ...(k === input.fileIds.length - 1 ? { cache_control: cache } : {}),
         }));
         return { role: 'user' as const, content: [...files, { type: 'text' as const, text: m.content }] };
       });
@@ -183,7 +191,7 @@ export function createClaudeProvider(cfg: LlmConfig): LlmProvider {
       const SEGMENT_MAX_TOKENS = 32_000;
       const MAX_SEGMENTS = 12;
       const system = systemText.trim()
-        ? [{ type: 'text' as const, text: systemText, cache_control: { type: 'ephemeral' as const } }]
+        ? [{ type: 'text' as const, text: systemText, cache_control: cache }]
         : undefined;
       let text = '';
       for (let segment = 0; segment < MAX_SEGMENTS; segment++) {
@@ -201,9 +209,9 @@ export function createClaudeProvider(cfg: LlmConfig): LlmProvider {
           : messages;
         const stream = client().beta.messages.stream(
           {
-            betas: [FILES_BETA, 'context-1m-2025-08-07'],
-            model: cfg.anthropicModel,
-            max_tokens: SEGMENT_MAX_TOKENS,
+            betas: [FILES_BETA, 'context-1m-2025-08-07', 'extended-cache-ttl-2025-04-11'],
+            model,
+            max_tokens: Math.min(SEGMENT_MAX_TOKENS, opts.maxTokens ?? SEGMENT_MAX_TOKENS),
             ...(system ? { system } : {}),
             messages: turns,
           },
@@ -211,14 +219,18 @@ export function createClaudeProvider(cfg: LlmConfig): LlmProvider {
         );
         const resp = await stream.finalMessage();
 
+        // Meter at the real price: cache reads cost 10%, cache writes 125% (5 min)
+        // or 200% (1 h) of the input rate — fold them into an equivalent input count.
+        const u = resp.usage;
+        const cacheWrite =
+          (u?.cache_creation?.ephemeral_1h_input_tokens ?? 0) * 2 +
+          (u?.cache_creation?.ephemeral_5m_input_tokens ?? 0) * 1.25 +
+          (u?.cache_creation ? 0 : (u?.cache_creation_input_tokens ?? 0) * 2);
         await recordUsage({
           provider: 'claude',
-          model: cfg.anthropicModel,
-          inputTokens:
-            (resp.usage?.input_tokens ?? 0) +
-            (resp.usage?.cache_read_input_tokens ?? 0) +
-            (resp.usage?.cache_creation_input_tokens ?? 0),
-          outputTokens: resp.usage?.output_tokens ?? 0,
+          model,
+          inputTokens: Math.round((u?.input_tokens ?? 0) + (u?.cache_read_input_tokens ?? 0) * 0.1 + cacheWrite),
+          outputTokens: u?.output_tokens ?? 0,
           feature: opts.label,
         });
 

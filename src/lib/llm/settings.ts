@@ -11,6 +11,8 @@ export interface LlmConfig {
   quoteEngine: 'database' | 'claude';
   /** Anthropic workspace id — required by the Files API with an org-wide key. */
   anthropicWorkspaceId: string;
+  /** Cheap Claude model for small jobs (section picking, simple chat answers). */
+  anthropicFastModel: string;
 }
 
 /**
@@ -28,5 +30,6 @@ export async function getEffectiveLlmConfig(): Promise<LlmConfig> {
     anthropicModel: row?.anthropicModel || env.llm.anthropicModel,
     quoteEngine: row?.quoteEngine === 'claude' ? 'claude' : 'database',
     anthropicWorkspaceId: row?.anthropicWorkspaceId?.trim() || '',
+    anthropicFastModel: row?.anthropicFastModel?.trim() || 'claude-haiku-4-5-20251001',
   };
 }
