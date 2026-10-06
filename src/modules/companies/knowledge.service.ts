@@ -228,34 +228,59 @@ async function buildCatalogueIndex(documentId: number, text: string, auth: Anthr
 
   // Replace the previous index of this file (files in Claude + rows).
   const old = await prisma.knowledgeSection.findMany({ where: { documentId }, select: { aiFileId: true } });
-  for (const o of old) await deleteKnowledgeFile(auth, o.aiFileId).catch(() => undefined);
+  for (const id of new Set(old.map((o) => o.aiFileId))) await deleteKnowledgeFile(auth, id).catch(() => undefined);
   await prisma.knowledgeSection.deleteMany({ where: { documentId } });
 
+  // Sections are the unit a BOQ PICKS; they are stored in Claude in BUNDLES of
+  // neighbouring sections (≈ 60k chars each) so a quote attaches a handful of
+  // files, not one per section — Anthropic counts every attached file as a fetch
+  // and allows ~100 fetches a minute. Each section row carries its bundle's id.
+  const BUNDLE_CHARS = 60_000;
+  const prepared = [...merged.values()]
+    .map((s) => {
+      const lines = [...new Set(s.lines)];
+      const text = `## SECTION: ${s.name}\n${lines.join('\n')}\n`;
+      return { ...s, lines, text };
+    })
+    .filter((s) => s.lines.length);
+  const header =
+    `BRAND: ${doc.brand ?? ''}\nFILE: ${doc.name || doc.fileName}\n` +
+    'Catalogue index — one product per line: catalogue number | description | price, grouped by section.\n\n';
+  const bundles: (typeof prepared)[] = [];
+  let cur: typeof prepared = [];
+  let size = 0;
+  for (const s of prepared) {
+    if (cur.length && size + s.text.length > BUNDLE_CHARS) {
+      bundles.push(cur);
+      cur = [];
+      size = 0;
+    }
+    cur.push(s);
+    size += s.text.length;
+  }
+  if (cur.length) bundles.push(cur);
+
   let count = 0;
-  for (const s of merged.values()) {
-    const lines = [...new Set(s.lines)];
-    if (!lines.length) continue;
-    const body =
-      `BRAND: ${doc.brand ?? ''}\nFILE: ${doc.name || doc.fileName}\nSECTION: ${s.name}\n` +
-      'Catalogue index — one product per line: catalogue number | description | price.\n\n' +
-      lines.join('\n') +
-      '\n';
+  for (const [i, bundle] of bundles.entries()) {
+    const body = header + bundle.map((s) => s.text).join('\n');
     const uploaded = await uploadKnowledgeText(
       auth,
-      knowledgeFileName(doc.brand ?? 'brand', `${doc.name || doc.fileName} — ${s.name}`, doc.fileName),
+      knowledgeFileName(doc.brand ?? 'brand', `${doc.name || doc.fileName} — index ${i + 1} of ${bundles.length}`, doc.fileName),
       body,
     );
-    await prisma.knowledgeSection.create({
-      data: {
-        documentId,
-        name: s.name,
-        keywords: [...s.keywords].filter(Boolean).join(', ').slice(0, 60_000),
-        aiFileId: uploaded.id,
-        chars: body.length,
-        lineCount: lines.length,
-      },
-    });
-    count++;
+    for (const s of bundle) {
+      await prisma.knowledgeSection.create({
+        data: {
+          documentId,
+          name: s.name,
+          keywords: [...s.keywords].filter(Boolean).join(', ').slice(0, 60_000),
+          aiFileId: uploaded.id,
+          chars: s.text.length,
+          lineCount: s.lines.length,
+        },
+      });
+      count++;
+    }
   }
   return count;
 }
@@ -434,7 +459,7 @@ export async function forgetClaudeFile(documentId: number): Promise<void> {
   const cfg = await getEffectiveLlmConfig();
   if (cfg.anthropicApiKey) {
     const auth = { apiKey: cfg.anthropicApiKey, workspaceId: cfg.anthropicWorkspaceId || undefined };
-    for (const id of [doc.aiFileId, doc.aiTextFileId, ...doc.sections.map((s) => s.aiFileId)]) {
+    for (const id of new Set([doc.aiFileId, doc.aiTextFileId, ...doc.sections.map((s) => s.aiFileId)])) {
       if (id) await deleteKnowledgeFile(auth, id).catch(() => undefined);
     }
   }

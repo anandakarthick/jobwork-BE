@@ -69,6 +69,15 @@ export function describeLlmError(err: unknown): LlmErrorInfo | null {
     };
   }
   if (found.status === 429 || lower.includes('rate limit')) {
+    if (lower.includes('url content fetching')) {
+      return {
+        status: 429,
+        message:
+          'Too many files were attached to AI requests within one minute (the provider allows about 100 file ' +
+          'fetches a minute). Re-train the brand\'s price lists so their catalogue index is stored in a few bundled ' +
+          'files, wait a minute, then try again.',
+      };
+    }
     // Keep the provider's own numbers ("…limit of 500,000 input tokens per minute") — they say what to do.
     const detail = /rate limit[^.]*\./i.exec(msg)?.[0];
     return {

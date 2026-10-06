@@ -300,11 +300,13 @@ async function attachmentsFor(
     ({ ids, partial } = await selectSectionsForBoq(provider, boqText, sections));
   }
   const chosen = sections.filter((s) => ids.includes(s.id));
+  // Sections share bundle files — attach each file once.
+  const bundleIds = [...new Set(chosen.map((s) => s.aiFileId))];
   return {
-    fileIds: [...chosen.map((s) => s.aiFileId), ...whole],
+    fileIds: [...bundleIds, ...whole],
     sectionIds: partial ? ids : null,
     partial,
-    detail: `${chosen.length} of ${sections.length} catalogue section(s)${whole.length ? ` + ${whole.length} full file(s)` : ''}`,
+    detail: `${chosen.length} of ${sections.length} catalogue section(s) in ${bundleIds.length} file(s)${whole.length ? ` + ${whole.length} full file(s)` : ''}`,
   };
 }
 
