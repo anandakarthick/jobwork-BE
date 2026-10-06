@@ -267,6 +267,7 @@ export async function updatePriceList(
 const promptSelect = {
   id: true,
   name: true,
+  groupName: true,
   content: true,
   train: true,
   createdAt: true,
@@ -323,11 +324,12 @@ export async function savePrompts(companyId: number, input: SavePromptsInput) {
       created.push({ name: p.name });
       ops.push(
         prisma.brandPrompt.create({
-          data: { companyId, name: p.name, content: p.content, train: p.train },
+          data: { companyId, name: p.name, groupName: p.group, content: p.content, train: p.train },
         }),
       );
     } else if (
       existing.name !== p.name ||
+      existing.groupName !== p.group ||
       existing.content !== p.content ||
       existing.train !== p.train
     ) {
@@ -338,6 +340,7 @@ export async function savePrompts(companyId: number, input: SavePromptsInput) {
           where: { id: existing.id },
           data: {
             name: p.name,
+            groupName: p.group,
             content: p.content,
             train: p.train,
             // Stale in Claude until trained again.
@@ -359,16 +362,24 @@ export async function savePrompts(companyId: number, input: SavePromptsInput) {
 
 /**
  * Every keyword prompt of the given brands (by name), for the rule picker on
- * Get Quote: id, name, brand and whether it is trained (= ticked by default).
+ * Get Quote: id, name, group, brand and whether it is common (= ticked by default).
+ * Ordered so the rules of one group sit together.
  */
 export async function listPromptsForBrands(brands: string[]) {
   if (brands.length === 0) return [];
   const rows = await prisma.brandPrompt.findMany({
     where: { company: { name: { in: brands } } },
-    select: { id: true, name: true, train: true, aiStatus: true, company: { select: { name: true } } },
-    orderBy: [{ companyId: 'asc' }, { id: 'asc' }],
+    select: { id: true, name: true, groupName: true, train: true, aiStatus: true, company: { select: { name: true } } },
+    orderBy: [{ companyId: 'asc' }, { groupName: 'asc' }, { id: 'asc' }],
   });
-  return rows.map((r) => ({ id: r.id, name: r.name, train: r.train, aiStatus: r.aiStatus, brand: r.company.name }));
+  return rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    group: r.groupName,
+    train: r.train,
+    aiStatus: r.aiStatus,
+    brand: r.company.name,
+  }));
 }
 
 /**

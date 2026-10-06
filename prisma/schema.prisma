@@ -404,6 +404,9 @@ model BrandPrompt {
   companyId Int      @map("company_id")
   /// Short label the user gives the prompt, e.g. "Rule 1".
   name      String   @default("") @db.VarChar(150)
+  /// Optional group the rule belongs to, e.g. "MCCB" — Get Quote lets the user
+  /// tick or untick a whole group at once. "" = ungrouped.
+  groupName String   @default("") @map("group_name") @db.VarChar(100)
   content   String   @db.LongText
   train     Boolean  @default(true)
   createdAt DateTime @default(now()) @map("created_at")

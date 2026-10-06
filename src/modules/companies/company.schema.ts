@@ -77,6 +77,8 @@ export const savePromptsSchema = z.object({
       z.object({
         id: z.number().int().positive().optional(),
         name: z.string().trim().max(150).default(''),
+        /** Group label (e.g. "MCCB"); "" = ungrouped. */
+        group: z.string().trim().max(100).default(''),
         // No length cap — stored as LONGTEXT.
         content: z.string().trim().min(1, 'A prompt cannot be empty'),
         train: z.boolean(),

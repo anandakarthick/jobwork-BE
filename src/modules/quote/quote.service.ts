@@ -53,13 +53,13 @@ export async function getQuote(id: number) {
   const rules = ids
     ? await prisma.brandPrompt.findMany({
         where: { id: { in: ids } },
-        select: { id: true, name: true, company: { select: { name: true } } },
-        orderBy: { id: 'asc' },
+        select: { id: true, name: true, groupName: true, company: { select: { name: true } } },
+        orderBy: [{ groupName: 'asc' }, { id: 'asc' }],
       })
     : [];
   return {
     ...quote,
-    rules: rules.map((r) => ({ id: r.id, name: r.name, brand: r.company.name })),
+    rules: rules.map((r) => ({ id: r.id, name: r.name, group: r.groupName, brand: r.company.name })),
   };
 }
 
