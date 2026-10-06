@@ -331,11 +331,17 @@ export async function selectSectionsForBoq(
   }
 }
 
-const NAME_STOP = new Set([
-  'range', 'for', 'the', 'and', 'of', 'with', 'units', 'unit', 'type', 'series', 'in', 'to', 'accessories',
-  'accessory', 'spares', 'spare', 'devices', 'device', 'products', 'product', 'solutions', 'solution', 'basic',
-  'advanced', 'standard', 'digital', 'modular', 'remote', 'general', 'other', 'misc', 'pole', 'poles',
-]);
+/**
+ * Words that occur in more than `share` of the given word lists — i.e. generic
+ * for THIS catalogue ("range", "accessories", "switch", "led", "3 pole"…) —
+ * learned from the brand's own sections at run time, never listed in code.
+ */
+function commonWords(lists: string[][], share: number): Set<string> {
+  const df = new Map<string, number>();
+  for (const l of lists) for (const w of new Set(l)) df.set(w, (df.get(w) ?? 0) + 1);
+  const limit = Math.max(2, Math.ceil(lists.length * share));
+  return new Set([...df.entries()].filter(([, n]) => n > limit).map(([w]) => w));
+}
 
 /**
  * Sections whose own KEYWORDS (written at indexing: product names, trade terms,
@@ -348,15 +354,17 @@ function keywordSections(boqText: string, sections: KnowledgeSectionInfo[]): num
   const norm = boqText.toLowerCase().replace(/[^a-z0-9]+/g, ' ');
   const squashed = norm.replace(/ /g, '');
   const acronyms = new Set((boqText.match(/\b[A-Z][A-Z0-9]{2,5}\b/g) ?? []).map((a) => a.toLowerCase()));
-  const GENERIC = new Set([
-    'led', 'lcd', 'fixed', 'rotary', 'modular', 'digital', 'panel', 'standard', 'basic', 'advanced', 'module',
-    'single', 'three', 'phase', 'type', 'series', 'range', 'red', 'blue', 'green', 'yellow', 'white', 'grey',
-    'black', 'amber', 'accessories', 'spares', 'kit', 'cable', 'power', 'control', 'switch', 'relay', 'device',
-  ]);
+  const phrases = (keywords: string) =>
+    keywords
+      .split(',')
+      .map((raw) => raw.trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim())
+      .filter(Boolean);
+  // A keyword shared by many sections of this catalogue ("led", "rs485", "3 pole")
+  // cannot point at one of them — learned from the sections, not listed in code.
+  const generic = commonWords(sections.map((s) => phrases(s.keywords)), 0.05);
   const phraseHits = (keywords: string): boolean => {
-    for (const raw of keywords.split(',')) {
-      const k = raw.trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-      if (!k || /^\d/.test(k) || GENERIC.has(k)) continue; // numbers / ratings / generic words
+    for (const k of phrases(keywords)) {
+      if (/^\d/.test(k) || generic.has(k)) continue; // numbers / ratings / catalogue-generic words
       const words = k.split(' ');
       if (words.length === 1) {
         // Single word: acronyms 3–5 chars must be upper-case in the BOQ; longer
@@ -375,32 +383,32 @@ function keywordSections(boqText: string, sections: KnowledgeSectionInfo[]): num
 }
 
 /**
- * A device family's accessory / spares sections always travel with it: if "DZ MCCB
- * Range" is picked, "Accessories for DZ MCCBs" is attached too, whatever the model
- * said. Purely by name: an accessory-type section whose name contains the family's
- * leading name tokens. (Price lists name these consistently; this costs little and
- * a missing accessory section is the commonest way to lose lines.)
+ * A device family's related sections always travel with it: if "DZ MCCB Range" is
+ * picked, "Accessories for DZ MCCBs" is attached too, whatever the model said.
+ * Nothing about accessories is written here — a section whose name contains
+ * another section's distinctive name words belongs to the same family, where
+ * "distinctive" = not common across this catalogue's section names.
  */
 function withCompanionSections(ids: number[], sections: KnowledgeSectionInfo[]): number[] {
-  const STOP = new Set(['range', 'for', 'the', 'and', 'of', 'with', 'units', 'unit', 'type', 'series', 'in', 'to']);
-  const tokens = (name: string) =>
+  const words = (name: string) =>
     name
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, ' ')
       .split(' ')
-      .filter((w) => w.length >= 2 && !STOP.has(w));
-  const isAccessory = (name: string) => /accessor|spare|module|kit/i.test(name);
+      .filter((w) => w.length >= 2);
+  const common = commonWords(sections.map((s) => words(s.name)), 0.15);
+  const core = (name: string) => words(name).filter((w) => !common.has(w)).slice(0, 2);
   const chosen = new Set(ids);
   for (const id of ids) {
     const s = sections.find((x) => x.id === id);
-    if (!s || isAccessory(s.name)) continue;
-    const core = tokens(s.name).slice(0, 2);
-    if (!core.length) continue;
+    if (!s) continue;
+    const c = core(s.name);
+    if (c.length < 1) continue;
     for (const a of sections) {
-      if (chosen.has(a.id) || a.documentId !== s.documentId || !isAccessory(a.name)) continue;
-      const words = tokens(a.name);
+      if (chosen.has(a.id) || a.documentId !== s.documentId) continue;
+      const ws = words(a.name);
       // Plural-tolerant containment ("mccb" matches "mccbs").
-      if (core.every((c) => words.some((w) => w === c || w.startsWith(c)))) chosen.add(a.id);
+      if (c.every((t) => ws.some((w) => w === t || w.startsWith(t) || t.startsWith(w)))) chosen.add(a.id);
     }
   }
   return [...chosen];
