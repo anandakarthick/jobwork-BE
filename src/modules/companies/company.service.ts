@@ -208,8 +208,10 @@ export async function addPriceLists(
       select: { id: true },
     });
     if (claude) {
-      // Knowledge-in-Claude engine: nothing is parsed or stored in our tables, and
-      // nothing is sent to Claude until the user clicks Train on the file.
+      // Knowledge-in-Claude engine: nothing is parsed into our tables. A file
+      // uploaded with Train ticked is trained right away — text + OCR, upload to
+      // Claude, catalogue index and sections — so it is quote-ready after save.
+      if (train) await startClaudeTraining(doc.id).catch(() => undefined);
       continue;
     }
     // Database engine: every file is read into text; trained ones are also ingested.
@@ -249,8 +251,12 @@ export async function updatePriceList(
     },
   });
   if (await claudeEngine()) {
-    // Claude engine: saving changes nothing in Claude — training is the user's
-    // explicit Train click. Un-ticking Train removes the file from Claude.
+    // Claude engine: ticking Train on a file that is not yet in Claude (or failed)
+    // trains it — text + OCR, upload, catalogue index and sections. A trained file
+    // is only re-trained by the Train again button. Un-ticking removes it from Claude.
+    if (input.train === true && (doc.aiStatus === 'NOT_STARTED' || doc.aiStatus === 'FAILED')) {
+      await startClaudeTraining(docId).catch(() => undefined);
+    }
     if (input.train === false && doc.aiFileId) await forgetClaudeFile(docId).catch(() => undefined);
     return prisma.productDocument.findUniqueOrThrow({ where: { id: docId }, select: priceListSelect });
   }
