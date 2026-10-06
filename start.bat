@@ -10,6 +10,9 @@ rem  their own windows, waits until the backend answers, then opens the app.
 rem  Paths are relative to this file, so it works from a desktop shortcut.
 rem =============================================================================
 set "ROOT=%~dp0"
+rem The script also ships inside the backend repo: when run from there, the
+rem project root (holding backend\ and frontend\) is one level up.
+if not exist "%ROOT%backend\" if exist "%ROOT%package.json" set "ROOT=%ROOT%..\"
 set "NEED_RERUN="
 
 echo.
