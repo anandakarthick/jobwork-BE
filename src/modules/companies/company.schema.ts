@@ -39,6 +39,17 @@ export const promptParamsSchema = z.object({
   promptId: z.coerce.number().int().positive(),
 });
 
+export const ruleGroupParamsSchema = z.object({
+  id: z.coerce.number().int().positive(),
+  groupId: z.coerce.number().int().positive(),
+});
+
+/** Rename one rule group in place (from the brand view page). */
+export const renameRuleGroupSchema = z.object({
+  name: z.string().trim().min(1, 'A group needs a name').max(100),
+});
+export type RenameRuleGroupInput = z.infer<typeof renameRuleGroupSchema>;
+
 /** Body for renaming a brand file and/or switching its training on/off. */
 export const updatePriceListSchema = z.object({
   name: z.string().trim().max(150).optional(),

@@ -12,6 +12,8 @@ import {
   parseTrainFlags,
   priceListDocParamsSchema,
   promptParamsSchema,
+  renameRuleGroupSchema,
+  ruleGroupParamsSchema,
   savePromptsSchema,
   statusBodySchema,
   updateCompanySchema,
@@ -145,6 +147,19 @@ companyRouter.post(
     res
       .status(202)
       .json(await companyService.trainPromptIntoClaude(Number(req.params.id), Number(req.params.promptId)));
+  }),
+);
+
+// Rename one rule group in place (brand view page).
+companyRouter.patch(
+  '/:id/rule-groups/:groupId',
+  requirePermission('companies.edit'),
+  validate(ruleGroupParamsSchema, 'params'),
+  validate(renameRuleGroupSchema),
+  asyncHandler(async (req, res) => {
+    res.json(
+      await companyService.renameRuleGroup(Number(req.params.id), Number(req.params.groupId), req.body),
+    );
   }),
 );
 

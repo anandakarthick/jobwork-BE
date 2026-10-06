@@ -10,6 +10,7 @@ import { forgetClaudeFile, forgetRuleFiles, startClaudeTraining, startRuleTraini
 import type {
   CreateCompanyInput,
   ListCompaniesQuery,
+  RenameRuleGroupInput,
   SavePromptsInput,
   UpdateCompanyInput,
   UpdatePriceListInput,
@@ -310,6 +311,25 @@ export async function listPrompts(companyId: number) {
     }),
   ]);
   return { groups, prompts };
+}
+
+/** Rename one group without touching the rest of the tree; returns the group list. */
+export async function renameRuleGroup(companyId: number, groupId: number, input: RenameRuleGroupInput) {
+  const group = await prisma.brandRuleGroup.findFirst({ where: { id: groupId, companyId } });
+  if (!group) throw HttpError.notFound('Group not found');
+  const clash = await prisma.brandRuleGroup.findFirst({
+    where: { companyId, id: { not: groupId }, name: input.name },
+    select: { id: true },
+  });
+  if (clash) throw HttpError.badRequest(`A group named "${input.name}" already exists on this brand`);
+  if (group.name !== input.name) {
+    await prisma.brandRuleGroup.update({ where: { id: groupId }, data: { name: input.name } });
+  }
+  return prisma.brandRuleGroup.findMany({
+    where: { companyId },
+    select: groupSelect,
+    orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+  });
 }
 
 /**
