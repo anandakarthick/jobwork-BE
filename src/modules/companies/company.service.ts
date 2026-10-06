@@ -267,7 +267,7 @@ export async function updatePriceList(
 const promptSelect = {
   id: true,
   name: true,
-  groupName: true,
+  groupId: true,
   content: true,
   train: true,
   createdAt: true,
@@ -286,77 +286,121 @@ export async function trainPromptIntoClaude(companyId: number, promptId: number)
   return prisma.brandPrompt.findUniqueOrThrow({ where: { id: promptId }, select: promptSelect });
 }
 
+const groupSelect = {
+  id: true,
+  name: true,
+  sortOrder: true,
+  createdAt: true,
+  updatedAt: true,
+} satisfies Prisma.BrandRuleGroupSelect;
+
+/** A brand's rule groups (in page order) and its rules. */
 export async function listPrompts(companyId: number) {
   await ensureCompany(companyId);
-  return prisma.brandPrompt.findMany({
-    where: { companyId },
-    select: promptSelect,
-    orderBy: { id: 'asc' },
-  });
+  const [groups, prompts] = await Promise.all([
+    prisma.brandRuleGroup.findMany({
+      where: { companyId },
+      select: groupSelect,
+      orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+    }),
+    prisma.brandPrompt.findMany({
+      where: { companyId },
+      select: promptSelect,
+      orderBy: { id: 'asc' },
+    }),
+  ]);
+  return { groups, prompts };
 }
 
 /**
- * Replace a brand's prompts with the submitted list. Only rows whose name, text
- * or train flag actually changed are written, so `updatedAt` keeps meaning "last
- * edited" for the rows the user didn't touch.
+ * Replace a brand's rule groups and rules with the submitted lists. Only rows
+ * whose name, group, text or train flag actually changed are written, so
+ * `updatedAt` keeps meaning "last edited" for the rows the user didn't touch.
  */
 export async function savePrompts(companyId: number, input: SavePromptsInput) {
   await ensureCompany(companyId);
-  const current = await prisma.brandPrompt.findMany({ where: { companyId } });
+  const [currentGroups, current] = await Promise.all([
+    prisma.brandRuleGroup.findMany({ where: { companyId } }),
+    prisma.brandPrompt.findMany({ where: { companyId } }),
+  ]);
+  const currentGroupById = new Map(currentGroups.map((g) => [g.id, g]));
   const currentById = new Map(current.map((p) => [p.id, p]));
-  const keptIds = new Set(input.prompts.flatMap((p) => (p.id != null ? [p.id] : [])));
 
-  const ops: Prisma.PrismaPromise<unknown>[] = [];
-  const removed = current.filter((p) => !keptIds.has(p.id)).map((p) => p.id);
-  if (removed.length) {
-    await forgetRuleFiles(removed).catch(() => undefined); // their copies in Claude go too
-    ops.push(prisma.brandPrompt.deleteMany({ where: { id: { in: removed } } }));
+  // Groups: every id must be this brand's, keys unique, names unique (case-insensitive).
+  const keys = new Set<string>();
+  const names = new Set<string>();
+  for (const g of input.groups) {
+    if (g.id != null && !currentGroupById.has(g.id)) throw HttpError.badRequest('Group does not belong to this brand');
+    if (keys.has(g.key)) throw HttpError.badRequest('Duplicate group key');
+    keys.add(g.key);
+    const lower = g.name.toLowerCase();
+    if (names.has(lower)) throw HttpError.badRequest(`Two groups are named "${g.name}" — give each group its own name`);
+    names.add(lower);
+  }
+  for (const p of input.prompts) {
+    if (p.id != null && !currentById.has(p.id)) throw HttpError.badRequest('Prompt does not belong to this brand');
+    if (p.groupKey != null && !keys.has(p.groupKey)) throw HttpError.badRequest('Rule refers to a group that is not in the list');
   }
 
-  // Rules whose TEXT changed (or are new) need training into Claude again — the
-  // file in Claude holds the old wording until then.
-  const changedText: number[] = [];
-  const created: { name: string }[] = [];
-  for (const p of input.prompts) {
-    const existing = p.id != null ? currentById.get(p.id) : undefined;
-    if (p.id != null && !existing) throw HttpError.badRequest('Prompt does not belong to this brand');
-    if (!existing) {
-      created.push({ name: p.name });
-      ops.push(
-        prisma.brandPrompt.create({
-          data: { companyId, name: p.name, groupName: p.group, content: p.content, train: p.train },
-        }),
-      );
-    } else if (
-      existing.name !== p.name ||
-      existing.groupName !== p.group ||
-      existing.content !== p.content ||
-      existing.train !== p.train
-    ) {
-      const textChanged = existing.content !== p.content || existing.name !== p.name;
-      if (textChanged) changedText.push(existing.id);
-      ops.push(
-        prisma.brandPrompt.update({
+  const keptGroupIds = new Set(input.groups.flatMap((g) => (g.id != null ? [g.id] : [])));
+  const removedGroups = currentGroups.filter((g) => !keptGroupIds.has(g.id)).map((g) => g.id);
+  const keptIds = new Set(input.prompts.flatMap((p) => (p.id != null ? [p.id] : [])));
+  const removed = current.filter((p) => !keptIds.has(p.id)).map((p) => p.id);
+  if (removed.length) await forgetRuleFiles(removed).catch(() => undefined); // their copies in Claude go too
+
+  await prisma.$transaction(async (tx) => {
+    if (removed.length) await tx.brandPrompt.deleteMany({ where: { id: { in: removed } } });
+    if (removedGroups.length) await tx.brandRuleGroup.deleteMany({ where: { id: { in: removedGroups } } });
+
+    // Groups first — new ones need their ids before the rules can point at them.
+    // Position in the list = display order.
+    const idByKey = new Map<string, number>();
+    for (const [i, g] of input.groups.entries()) {
+      const existing = g.id != null ? currentGroupById.get(g.id) : undefined;
+      if (!existing) {
+        const row = await tx.brandRuleGroup.create({ data: { companyId, name: g.name, sortOrder: i } });
+        idByKey.set(g.key, row.id);
+      } else {
+        if (existing.name !== g.name || existing.sortOrder !== i) {
+          await tx.brandRuleGroup.update({ where: { id: existing.id }, data: { name: g.name, sortOrder: i } });
+        }
+        idByKey.set(g.key, existing.id);
+      }
+    }
+
+    // Rules whose TEXT changed (or are new) need training into Claude again — the
+    // file in Claude holds the old wording until then.
+    for (const p of input.prompts) {
+      const groupId = p.groupKey != null ? idByKey.get(p.groupKey) ?? null : null;
+      const existing = p.id != null ? currentById.get(p.id) : undefined;
+      if (!existing) {
+        await tx.brandPrompt.create({
+          data: { companyId, name: p.name, groupId, content: p.content, train: p.train },
+        });
+      } else if (
+        existing.name !== p.name ||
+        existing.groupId !== groupId ||
+        existing.content !== p.content ||
+        existing.train !== p.train
+      ) {
+        const textChanged = existing.content !== p.content || existing.name !== p.name;
+        await tx.brandPrompt.update({
           where: { id: existing.id },
           data: {
             name: p.name,
-            groupName: p.group,
+            groupId,
             content: p.content,
             train: p.train,
             // Stale in Claude until trained again.
             ...(textChanged && existing.aiStatus !== 'NOT_STARTED' ? { aiStatus: 'NOT_STARTED' as const } : {}),
           },
-        }),
-      );
+        });
+      }
     }
-  }
-
-  if (ops.length) await prisma.$transaction(ops);
+  });
   // Claude engine: nothing is sent to Claude on save — a new or edited rule shows
   // "not trained" until the user clicks Train (again). An untrained selected rule
   // is still sent to a quote as text, so nothing is lost meanwhile.
-  void created;
-  void changedText;
   return listPrompts(companyId);
 }
 
@@ -369,13 +413,21 @@ export async function listPromptsForBrands(brands: string[]) {
   if (brands.length === 0) return [];
   const rows = await prisma.brandPrompt.findMany({
     where: { company: { name: { in: brands } } },
-    select: { id: true, name: true, groupName: true, train: true, aiStatus: true, company: { select: { name: true } } },
-    orderBy: [{ companyId: 'asc' }, { groupName: 'asc' }, { id: 'asc' }],
+    select: {
+      id: true,
+      name: true,
+      train: true,
+      aiStatus: true,
+      company: { select: { name: true } },
+      group: { select: { id: true, name: true, sortOrder: true } },
+    },
+    orderBy: [{ companyId: 'asc' }, { group: { sortOrder: 'asc' } }, { groupId: 'asc' }, { id: 'asc' }],
   });
   return rows.map((r) => ({
     id: r.id,
     name: r.name,
-    group: r.groupName,
+    groupId: r.group?.id ?? null,
+    group: r.group?.name ?? '',
     train: r.train,
     aiStatus: r.aiStatus,
     brand: r.company.name,

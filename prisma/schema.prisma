@@ -384,6 +384,7 @@ model Company {
   categories        ProductCategory[] @relation("CategoryCompanies")
   priceListDocuments ProductDocument[] @relation("CompanyPriceLists")
   prompts           BrandPrompt[]
+  ruleGroups        BrandRuleGroup[]
 
   @@index([createdById])
   @@index([status])
@@ -404,18 +405,38 @@ model BrandPrompt {
   companyId Int      @map("company_id")
   /// Short label the user gives the prompt, e.g. "Rule 1".
   name      String   @default("") @db.VarChar(150)
-  /// Optional group the rule belongs to, e.g. "MCCB" — Get Quote lets the user
-  /// tick or untick a whole group at once. "" = ungrouped.
-  groupName String   @default("") @map("group_name") @db.VarChar(100)
+  /// The group the rule was created in (e.g. "MCCB"); null = an older ungrouped rule.
+  groupId   Int?     @map("group_id")
   content   String   @db.LongText
   train     Boolean  @default(true)
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  company Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  group   BrandRuleGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
 
   @@index([companyId, train])
+  @@index([groupId])
   @@map("brand_prompts")
+}
+
+/// A named group of a brand's rules (e.g. "MCCB"). Rules are created inside a
+/// group; Get Quote lists them under it and can tick the whole group at once.
+model BrandRuleGroup {
+  id        Int      @id @default(autoincrement())
+  companyId Int      @map("company_id")
+  name      String   @db.VarChar(100)
+  /// Position among the brand's groups, as arranged on the brand page.
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  company Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  prompts BrandPrompt[]
+
+  @@unique([companyId, name])
+  @@index([companyId, sortOrder])
+  @@map("brand_rule_groups")
 }
 
 /// A product category (e.g. "MCCB") and the brands it supports.

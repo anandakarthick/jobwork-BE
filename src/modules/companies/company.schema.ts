@@ -67,24 +67,34 @@ export function parseFileNames(raw: unknown): string[] {
 }
 
 /**
- * The brand's full list of keyword prompts, as the form holds it. Rows with an
- * `id` are existing prompts (updated if changed); rows without are new; existing
- * prompts left out of the list are deleted.
+ * The brand's rule groups and rules, as the form holds them. Rows with an `id`
+ * are existing records (updated if changed); rows without are new; existing
+ * records left out of the lists are deleted. A rule names its group by the
+ * group's form `key` (new groups have no id yet); `groupKey: null` = ungrouped.
  */
 export const savePromptsSchema = z.object({
+  groups: z
+    .array(
+      z.object({
+        id: z.number().int().positive().optional(),
+        key: z.string().trim().min(1).max(60),
+        name: z.string().trim().min(1, 'A group needs a name').max(100),
+      }),
+    )
+    .max(100)
+    .default([]),
   prompts: z
     .array(
       z.object({
         id: z.number().int().positive().optional(),
         name: z.string().trim().max(150).default(''),
-        /** Group label (e.g. "MCCB"); "" = ungrouped. */
-        group: z.string().trim().max(100).default(''),
+        groupKey: z.string().trim().min(1).max(60).nullable().default(null),
         // No length cap — stored as LONGTEXT.
         content: z.string().trim().min(1, 'A prompt cannot be empty'),
         train: z.boolean(),
       }),
     )
-    .max(100),
+    .max(500),
 });
 
 export type SavePromptsInput = z.infer<typeof savePromptsSchema>;
