@@ -316,14 +316,94 @@ export async function selectSectionsForBoq(
       { system, json: true, maxTokens: 2000, label: 'knowledge:select', tier: 'fast' },
     );
     const parsed = parseJson<{ sectionIds?: unknown }>(raw);
-    const ids = Array.isArray(parsed.sectionIds)
+    let ids = Array.isArray(parsed.sectionIds)
       ? parsed.sectionIds.map((v) => Number(v)).filter((n) => all.includes(n))
       : [];
     if (!ids.length) return { ids: all, partial: false };
-    return { ids: [...new Set(ids)], partial: ids.length < all.length };
+    // The model's pick varies a little run to run; union it with a plain word match
+    // between the BOQ and the section names ("meter" in the BOQ → every *Meters*
+    // section), then add each family's accessory sections. Recall over economy.
+    ids = [...new Set([...ids, ...keywordSections(boqText, sections)])];
+    ids = withCompanionSections(ids, sections);
+    return { ids, partial: ids.length < all.length };
   } catch {
     return { ids: all, partial: false };
   }
+}
+
+const NAME_STOP = new Set([
+  'range', 'for', 'the', 'and', 'of', 'with', 'units', 'unit', 'type', 'series', 'in', 'to', 'accessories',
+  'accessory', 'spares', 'spare', 'devices', 'device', 'products', 'product', 'solutions', 'solution', 'basic',
+  'advanced', 'standard', 'digital', 'modular', 'remote', 'general', 'other', 'misc', 'pole', 'poles',
+]);
+
+/**
+ * Sections whose own KEYWORDS (written at indexing: product names, trade terms,
+ * acronyms) occur in the BOQ text. Phrases are compared with spaces removed, so
+ * "multi function meter" finds "multifunction meter"; short acronyms (MFM, ELR,
+ * MCCB) must appear as upper-case words in the BOQ. Generic single words and bare
+ * numbers / ratings are ignored.
+ */
+function keywordSections(boqText: string, sections: KnowledgeSectionInfo[]): number[] {
+  const norm = boqText.toLowerCase().replace(/[^a-z0-9]+/g, ' ');
+  const squashed = norm.replace(/ /g, '');
+  const acronyms = new Set((boqText.match(/\b[A-Z][A-Z0-9]{2,5}\b/g) ?? []).map((a) => a.toLowerCase()));
+  const GENERIC = new Set([
+    'led', 'lcd', 'fixed', 'rotary', 'modular', 'digital', 'panel', 'standard', 'basic', 'advanced', 'module',
+    'single', 'three', 'phase', 'type', 'series', 'range', 'red', 'blue', 'green', 'yellow', 'white', 'grey',
+    'black', 'amber', 'accessories', 'spares', 'kit', 'cable', 'power', 'control', 'switch', 'relay', 'device',
+  ]);
+  const phraseHits = (keywords: string): boolean => {
+    for (const raw of keywords.split(',')) {
+      const k = raw.trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      if (!k || /^\d/.test(k) || GENERIC.has(k)) continue; // numbers / ratings / generic words
+      const words = k.split(' ');
+      if (words.length === 1) {
+        // Single word: acronyms 3–5 chars must be upper-case in the BOQ; longer
+        // words must be whole words in the BOQ.
+        if (k.length <= 5) {
+          if (acronyms.has(k)) return true;
+        } else if (new RegExp(`\\b${k}s?\\b`).test(norm)) return true;
+        continue;
+      }
+      const sq = k.replace(/ /g, '');
+      if (sq.length >= 6 && squashed.includes(sq)) return true;
+    }
+    return false;
+  };
+  return sections.filter((s) => phraseHits(s.keywords)).map((s) => s.id);
+}
+
+/**
+ * A device family's accessory / spares sections always travel with it: if "DZ MCCB
+ * Range" is picked, "Accessories for DZ MCCBs" is attached too, whatever the model
+ * said. Purely by name: an accessory-type section whose name contains the family's
+ * leading name tokens. (Price lists name these consistently; this costs little and
+ * a missing accessory section is the commonest way to lose lines.)
+ */
+function withCompanionSections(ids: number[], sections: KnowledgeSectionInfo[]): number[] {
+  const STOP = new Set(['range', 'for', 'the', 'and', 'of', 'with', 'units', 'unit', 'type', 'series', 'in', 'to']);
+  const tokens = (name: string) =>
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .split(' ')
+      .filter((w) => w.length >= 2 && !STOP.has(w));
+  const isAccessory = (name: string) => /accessor|spare|module|kit/i.test(name);
+  const chosen = new Set(ids);
+  for (const id of ids) {
+    const s = sections.find((x) => x.id === id);
+    if (!s || isAccessory(s.name)) continue;
+    const core = tokens(s.name).slice(0, 2);
+    if (!core.length) continue;
+    for (const a of sections) {
+      if (chosen.has(a.id) || a.documentId !== s.documentId || !isAccessory(a.name)) continue;
+      const words = tokens(a.name);
+      // Plural-tolerant containment ("mccb" matches "mccbs").
+      if (core.every((c) => words.some((w) => w === c || w.startsWith(c)))) chosen.add(a.id);
+    }
+  }
+  return [...chosen];
 }
 
 /** Train every "Train"-ticked file of a brand into Claude. */

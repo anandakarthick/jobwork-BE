@@ -334,10 +334,11 @@ export async function generateWithKnowledge(input: GenerateInput): Promise<Knowl
   const attach = await attachmentsFor(input.provider, input.brands, files, input.boqText, input.sectionIds);
   const result = await generateOnce(input, files, attach.fileIds, attach.detail);
   result.sectionIds = attach.sectionIds;
-  // Safety net: if only some sections were attached and many lines came back
-  // unpriced, the pick probably missed a section — run once more with everything.
+  // Safety net: if only some sections were attached and a noticeable share of
+  // lines came back unpriced, the pick probably missed a section — run once more
+  // with everything and keep the better result.
   const unpriced = result.total - result.matched;
-  if (attach.partial && result.total > 0 && unpriced / result.total > 0.3) {
+  if (attach.partial && result.total > 0 && unpriced / result.total > 0.15) {
     const all = await attachmentsFor(input.provider, input.brands, files, input.boqText, null);
     const allIds = (await knowledgeSectionsForBrands(input.brands)).map((s) => s.id);
     const full = await attachmentsFor(input.provider, input.brands, files, input.boqText, allIds);
