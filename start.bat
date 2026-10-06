@@ -12,7 +12,22 @@ rem ============================================================================
 set "ROOT=%~dp0"
 rem The script also ships inside the backend repo: when run from there, the
 rem project root (holding backend\ and frontend\) is one level up.
-if not exist "%ROOT%backend\" if exist "%ROOT%package.json" set "ROOT=%ROOT%..\"
+if not exist "%BE%\" if not exist "%ROOT%jobwork-BE\" if exist "%ROOT%package.json" set "ROOT=%ROOT%..\"
+rem The two projects may be cloned as backend + frontend or as jobwork-BE + jobwork-FE.
+set "BE=%BE%"
+if not exist "%BE%\" set "BE=%ROOT%jobwork-BE"
+set "FE=%FE%"
+if not exist "%FE%\" set "FE=%ROOT%jobwork-FE"
+if not exist "%BE%package.json" (
+  echo  [error]  Backend folder not found next to this script ^(expected backend or jobwork-BE^).
+  pause
+  exit /b 1
+)
+if not exist "%FE%package.json" (
+  echo  [error]  Frontend folder not found next to this script ^(expected frontend or jobwork-FE^).
+  pause
+  exit /b 1
+)
 set "NEED_RERUN="
 
 echo.
@@ -94,7 +109,7 @@ if errorlevel 1 (
 )
 
 rem --- backend\.env must exist ------------------------------------------------
-if not exist "%ROOT%backend\.env" (
+if not exist "%BE%\.env" (
   echo  [config]   backend\.env is missing. Create it with at least:
   echo             DATABASE_URL="mysql://root:@localhost:3306/jobwork_local"
   echo             PORT=4000
@@ -111,9 +126,9 @@ echo  Jobwork - starting...
 echo.
 
 rem --- Backend -----------------------------------------------------------------
-if not exist "%ROOT%backend\node_modules\" (
+if not exist "%BE%\node_modules\" (
   echo  [backend]  installing dependencies ^(first run^)...
-  pushd "%ROOT%backend"
+  pushd "%BE%"
   call npm install
   call npx prisma generate
   popd
@@ -121,17 +136,17 @@ if not exist "%ROOT%backend\node_modules\" (
 echo  [backend]  starting on http://localhost:4000 ...
 rem migrate deploy = apply new database migrations; prisma generate = rebuild the DB
 rem client for the current schema (needed after every git pull that changes it).
-start "Jobwork backend :4000" cmd /k "cd /d "%ROOT%backend" && npx prisma migrate deploy && npx prisma generate && npm run dev"
+start "Jobwork backend :4000" cmd /k "cd /d "%BE%" && npx prisma migrate deploy && npx prisma generate && npm run dev"
 
 rem --- Frontend ----------------------------------------------------------------
-if not exist "%ROOT%frontend\node_modules\" (
+if not exist "%FE%\node_modules\" (
   echo  [frontend] installing dependencies ^(first run^)...
-  pushd "%ROOT%frontend"
+  pushd "%FE%"
   call npm install
   popd
 )
 echo  [frontend] starting on http://localhost:5175 ...
-start "Jobwork frontend :5175" cmd /k "cd /d "%ROOT%frontend" && npm run dev"
+start "Jobwork frontend :5175" cmd /k "cd /d "%FE%" && npm run dev"
 
 rem --- Wait for the backend to answer before opening the browser -------------
 echo.
