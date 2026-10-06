@@ -12,18 +12,18 @@ rem ============================================================================
 set "ROOT=%~dp0"
 rem The script also ships inside the backend repo: when run from there, the
 rem project root (holding backend\ and frontend\) is one level up.
-if not exist "%BE%\" if not exist "%ROOT%jobwork-BE\" if exist "%ROOT%package.json" set "ROOT=%ROOT%..\"
+if not exist "%ROOT%backend\" if not exist "%ROOT%jobwork-BE\" if exist "%ROOT%package.json" set "ROOT=%ROOT%..\"
 rem The two projects may be cloned as backend + frontend or as jobwork-BE + jobwork-FE.
-set "BE=%BE%"
+set "BE=%ROOT%backend"
 if not exist "%BE%\" set "BE=%ROOT%jobwork-BE"
-set "FE=%FE%"
+set "FE=%ROOT%frontend"
 if not exist "%FE%\" set "FE=%ROOT%jobwork-FE"
-if not exist "%BE%package.json" (
+if not exist "%BE%\package.json" (
   echo  [error]  Backend folder not found next to this script ^(expected backend or jobwork-BE^).
   pause
   exit /b 1
 )
-if not exist "%FE%package.json" (
+if not exist "%FE%\package.json" (
   echo  [error]  Frontend folder not found next to this script ^(expected frontend or jobwork-FE^).
   pause
   exit /b 1
