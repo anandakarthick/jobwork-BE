@@ -69,7 +69,15 @@ export function describeLlmError(err: unknown): LlmErrorInfo | null {
     };
   }
   if (found.status === 429 || lower.includes('rate limit')) {
-    return { status: 429, message: 'The AI provider is rate-limiting requests right now. Wait a minute and try again.' };
+    // Keep the provider's own numbers ("…limit of 500,000 input tokens per minute") — they say what to do.
+    const detail = /rate limit[^.]*\./i.exec(msg)?.[0];
+    return {
+      status: 429,
+      message:
+        'The AI provider rate-limited this request even after several automatic retries. ' +
+        (detail ? `Provider says: ${detail} ` : '') +
+        'Wait a minute, make sure no other quote is running on the same API key, then try again.',
+    };
   }
   if (found.status === 529 || lower.includes('overloaded')) {
     return { status: 503, message: 'The AI provider is overloaded at the moment. Try again in a few minutes.' };

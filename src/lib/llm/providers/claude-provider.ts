@@ -22,6 +22,50 @@ import { FILES_BETA, anthropicClient } from '../anthropic-files';
  *    calls; they don't benefit from it and it adds latency + tokens.
  *  - The stable system prompt is sent as a cached prefix (`cache_control`).
  */
+/** Seconds to wait before retry `attempt` (1-based) when the provider gives no retry-after. */
+const RETRY_WAITS_S = [15, 30, 45, 60, 90];
+
+/**
+ * Run a provider call, retrying on 429 (rate limit) / 529 (overloaded) / 503.
+ * Honours the `retry-after` header when present. Anything else is thrown as is.
+ */
+async function withRateLimitRetry<T>(call: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await call();
+    } catch (err) {
+      const e = err as { status?: number; headers?: Record<string, string> | Headers; message?: string };
+      const msg = String(e?.message ?? '');
+      const transient =
+        e?.status === 429 || e?.status === 529 || e?.status === 503 || /rate.?limit|overloaded/i.test(msg);
+      if (!transient || attempt > RETRY_WAITS_S.length) throw err;
+      let waitS = RETRY_WAITS_S[attempt - 1]!;
+      const h = e.headers;
+      const ra = h && (typeof (h as Headers).get === 'function' ? (h as Headers).get('retry-after') : (h as Record<string, string>)['retry-after']);
+      if (ra && Number.isFinite(Number(ra))) waitS = Math.min(120, Math.max(waitS, Number(ra)));
+      console.warn(`[claude] ${e?.status ?? 'transient'} — retrying in ${waitS}s (attempt ${attempt}/${RETRY_WAITS_S.length})`);
+      await new Promise((r) => setTimeout(r, waitS * 1000));
+    }
+  }
+}
+
+/**
+ * Only ONE large (main-model) knowledge request runs at a time per server: two
+ * quotes started together would otherwise add their price-list tokens in the same
+ * minute and trip the input-tokens-per-minute limit. Others wait their turn.
+ */
+let mainQueue: Promise<void> = Promise.resolve();
+/** Option objects already holding a turn in the queue (prevents re-queueing). */
+const serialisedOpts = new WeakSet<object>();
+function serialised<T>(fn: () => Promise<T>): Promise<T> {
+  const run = mainQueue.then(fn, fn);
+  mainQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 export function createClaudeProvider(cfg: LlmConfig): LlmProvider {
   function client() {
     // Carries the workspace header when configured (needed for file references).
@@ -151,6 +195,12 @@ export function createClaudeProvider(cfg: LlmConfig): LlmProvider {
      */
     async completeWithKnowledge(input: KnowledgeInput, opts: CompleteOptions = {}): Promise<string> {
       if (!this.isConfigured()) throw new LlmNotConfiguredError(this.name);
+      // Big main-model requests take turns; small fast-model calls run freely.
+      if (opts.tier !== 'fast' && input.fileIds.length && !serialisedOpts.has(opts)) {
+        const inner = { ...opts };
+        serialisedOpts.add(inner);
+        return serialised(() => this.completeWithKnowledge!(input, inner));
+      }
       const jsonHint = opts.json
         ? '\n\nReturn ONLY a single valid JSON value. No markdown fences, no commentary.'
         : '';
@@ -207,17 +257,24 @@ export function createClaudeProvider(cfg: LlmConfig): LlmProvider {
               },
             ]
           : messages;
-        const stream = client().beta.messages.stream(
-          {
-            betas: [FILES_BETA, 'context-1m-2025-08-07', 'extended-cache-ttl-2025-04-11'],
-            model,
-            max_tokens: Math.min(SEGMENT_MAX_TOKENS, opts.maxTokens ?? SEGMENT_MAX_TOKENS),
-            ...(system ? { system } : {}),
-            messages: turns,
-          },
-          { timeout: 30 * 60 * 1000 },
+        // Rate limits (429) and overload (529) are transient: wait as the provider
+        // asks (retry-after) or with a growing pause, and try again — up to 5 times
+        // (≈ 4 minutes) before giving up. A rejected request is never billed, so
+        // retrying costs nothing but time.
+        const resp = await withRateLimitRetry(() =>
+          client()
+            .beta.messages.stream(
+              {
+                betas: [FILES_BETA, 'context-1m-2025-08-07', 'extended-cache-ttl-2025-04-11'],
+                model,
+                max_tokens: Math.min(SEGMENT_MAX_TOKENS, opts.maxTokens ?? SEGMENT_MAX_TOKENS),
+                ...(system ? { system } : {}),
+                messages: turns,
+              },
+              { timeout: 30 * 60 * 1000, maxRetries: 2 },
+            )
+            .finalMessage(),
         );
-        const resp = await stream.finalMessage();
 
         // Meter at the real price: cache reads cost 10%, cache writes 125% (5 min)
         // or 200% (1 h) of the input rate — fold them into an equivalent input count.
