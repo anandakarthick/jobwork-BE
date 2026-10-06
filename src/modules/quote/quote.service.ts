@@ -5,6 +5,7 @@ import { HttpError } from '../../lib/http-error';
 import { getEffectiveLlmConfig, getLlmProvider, type LlmMessage } from '../../lib/llm';
 import { chatWithKnowledge, generateWithKnowledge, type KnowledgeResult } from './quote.knowledge';
 import { knowledgeRulesForQuote } from '../companies/knowledge.service';
+import { friendlyErrorMessage } from '../../lib/llm/errors';
 import { readInputs, type InputFile } from './quote.reader';
 import {
   applyRuleAccessories,
@@ -475,7 +476,8 @@ async function processQuote(quoteId: number, input: CreateQuoteInput, files: Sto
       }),
     ]);
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Quote generation failed';
+    // Stored on the quote and shown in the chat — the provider's reason in plain words.
+    const message = friendlyErrorMessage(err, 'Quote generation failed');
     await prisma.quote.update({
       where: { id: quoteId },
       data: { status: 'FAILED', error: message.slice(0, 2000) },

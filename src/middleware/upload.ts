@@ -35,8 +35,9 @@ export function createUploader(subdir: string) {
 
   const upload = multer({
     storage,
-    // Price-list PDFs can be large (tens of MB), so allow up to 60MB.
-    limits: { fileSize: 60 * 1024 * 1024, files: 20 },
+    // No size limit: price-list PDFs can run to hundreds of MB and only their
+    // extracted text ever goes to the AI. Files are streamed to disk.
+    limits: { files: 50 },
     fileFilter: (_req, file, cb) => {
       if (ACCEPTED_MIME.has(file.mimetype)) return cb(null, true);
       cb(new Error(`Unsupported file type: ${file.mimetype}`));

@@ -188,18 +188,10 @@ async function buildCatalogueIndex(documentId: number, text: string, auth: Anthr
   const label = `${doc.brand ?? ''} — ${doc.name || doc.fileName}`;
 
   type Section = { name: string; keywords: Set<string>; lines: string[] };
+  type RawSection = { name?: unknown; keywords?: unknown; lines?: unknown };
   const merged = new Map<string, Section>();
-  const chunks = chunkByPages(text, INDEX_CHUNK_CHARS);
-  for (const [i, chunk] of chunks.entries()) {
-    const raw = await provider.completeWithKnowledge(
-      {
-        fileIds: [],
-        messages: [{ role: 'user', content: `PRICE LIST: ${label} (part ${i + 1} of ${chunks.length})\n\n${chunk}` }],
-      },
-      { system, json: true, label: 'knowledge:index' },
-    );
-    const parsed = parseJson<{ sections?: { name?: unknown; keywords?: unknown; lines?: unknown }[] }>(raw);
-    for (const s of parsed.sections ?? []) {
+  const absorb = (sections: RawSection[]) => {
+    for (const s of sections) {
       const name = String(s.name ?? '').trim().slice(0, 190);
       if (!name) continue;
       const key = name.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
@@ -208,7 +200,31 @@ async function buildCatalogueIndex(documentId: number, text: string, auth: Anthr
       if (Array.isArray(s.lines)) for (const l of s.lines) if (String(l).trim()) entry.lines.push(String(l).trim());
       merged.set(key, entry);
     }
-  }
+  };
+  // Index one chunk. A malformed answer (cut-off / bad JSON) is retried once and,
+  // if still unusable, the chunk is split in half and each half indexed — a
+  // smaller piece gives a shorter, safer answer. Below ~8k chars we give up on it.
+  const indexChunk = async (chunk: string, part: string, attempt = 0): Promise<void> => {
+    const raw = await provider.completeWithKnowledge!(
+      { fileIds: [], messages: [{ role: 'user', content: `PRICE LIST: ${label} (${part})\n\n${chunk}` }] },
+      { system, json: true, label: 'knowledge:index' },
+    );
+    try {
+      absorb(parseJson<{ sections?: RawSection[] }>(raw).sections ?? []);
+    } catch (err) {
+      if (attempt === 0) return indexChunk(chunk, part, 1);
+      if (chunk.length > 8_000) {
+        const cut = chunk.lastIndexOf('\n[page ', Math.floor(chunk.length / 2));
+        const at = cut > 1000 ? cut : Math.floor(chunk.length / 2);
+        await indexChunk(chunk.slice(0, at), `${part}a`);
+        await indexChunk(chunk.slice(at), `${part}b`);
+        return;
+      }
+      console.warn('[knowledge] index chunk skipped:', part, err instanceof Error ? err.message : err);
+    }
+  };
+  const chunks = chunkByPages(text, INDEX_CHUNK_CHARS);
+  for (const [i, chunk] of chunks.entries()) await indexChunk(chunk, `part ${i + 1} of ${chunks.length}`);
 
   // Replace the previous index of this file (files in Claude + rows).
   const old = await prisma.knowledgeSection.findMany({ where: { documentId }, select: { aiFileId: true } });
