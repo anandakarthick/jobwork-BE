@@ -90,64 +90,6 @@ export const PROMPT_DEFAULTS = {
       'when nothing changes; "fileName" only when the user asks to rename the download.',
     ].join('\n'),
   },
-  'knowledge.index.system': {
-    name: 'Claude knowledge — catalogue index (training)',
-    description:
-      'Used once per price-list file at training time. Claude reads the file\'s text and writes a compact catalogue index — one line per product, grouped by the price list\'s own sections. Quotes attach these index sections instead of the raw text.',
-    content: [
-      'You receive part of the text of a brand\'s price list / catalogue. Turn it into a',
-      'compact catalogue INDEX: every product that has a catalogue number and a price,',
-      'one line each, grouped by the price list\'s own sections (its headings).',
-      '',
-      'For every product line write: catalogue number | description as printed (model /',
-      'series / frame, release or variant, poles, rating, breaking capacity, voltage,',
-      'colour — whatever the row and its table headings state) | price exactly as printed.',
-      'Copy codes and prices character for character; never invent, round or merge.',
-      'Keep the heading words that qualify a table (e.g. the release model, pole count,',
-      'kA class named above a table) ON each line of that table, because the line will be',
-      'read on its own later. Drop marketing text, covers, addresses, terms and repeated',
-      'column titles. Accessory tables are sections too (name them by what they fit).',
-      '',
-      'Return ONLY JSON: { "sections": [ { "name": string, "keywords": string[],',
-      '"lines": string[] } ] }. "name" = the section heading as the price list names it',
-      '(product family / range); "keywords" = 5-15 lowercase words a BOQ might use for',
-      'these products (product type, series names, abbreviations, ratings range);',
-      '"lines" = the product lines. Use the same section name for the same family across',
-      'tables so sections can be merged.',
-    ].join('\n'),
-  },
-  'knowledge.select.system': {
-    name: 'Claude knowledge — section pick for a BOQ',
-    description:
-      'Run by the fast model before a quote: given the BOQ text and the list of catalogue sections (name + keywords), it names the sections the quote needs so only those are attached.',
-    content: [
-      'You decide which sections of a brand\'s catalogue index are needed to price a BOQ.',
-      'You receive the BOQ text and the list of available sections (id, name, keywords).',
-      'Pick every section that could contain a product the BOQ asks for:',
-      '- the main devices of every line (all series / families that could satisfy a line,',
-      '  not just one), and the ACCESSORY / spares / module sections of each of those',
-      '  families;',
-      '- everything the BOQ names besides the main devices: indication lamps, selector',
-      '  switches, meters, current transformers, relays (earth fault, protection), timers,',
-      '  terminals, enclosures, busbar and the like;',
-      '- anything a brand rule in the BOQ context may add (handles, spreader links,',
-      '  neutral CTs, modules).',
-      'When in doubt include the section: a missing section means a line cannot be',
-      'priced, an extra one only costs a little. Return ONLY JSON: { "sectionIds": number[] }.',
-    ].join('\n'),
-  },
-  'knowledge.classify.system': {
-    name: 'Claude knowledge — chat message kind',
-    description:
-      'Run by the fast model on each chat message: is it a question (answer only) or a request to change the quote (needs the main model)?',
-    content: [
-      'Classify the user\'s latest chat message about a generated quote.',
-      '"change" = they want the quote altered (different product/series, quantities,',
-      'discounts, add/remove items or feeders, regenerate, apply a rule differently,',
-      'rename the file). "question" = they want information or an explanation only.',
-      'Return ONLY JSON: { "kind": "question" | "change" }.',
-    ].join('\n'),
-  },
 } satisfies Record<string, PromptDefault>;
 
 export type PromptKey = keyof typeof PROMPT_DEFAULTS;

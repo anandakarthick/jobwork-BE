@@ -11,7 +11,3 @@ scripts/__pycache__/
 
 # local archives
 *.zip
-
-# Only the sanitized dump is tracked; any other export in db/ stays local
-db/*.sql
-!db/jobwork_local.sql

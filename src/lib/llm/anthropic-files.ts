@@ -9,7 +9,6 @@
  * `anthropic-workspace-id` header; a workspace-scoped key needs no header.
  */
 import Anthropic, { toFile } from '@anthropic-ai/sdk';
-import { friendlyErrorMessage } from './errors';
 
 export const FILES_BETA = 'files-api-2025-04-14' as const;
 
@@ -84,5 +83,13 @@ export async function knowledgeFileExists(auth: AnthropicAuth, fileId: string): 
 
 /** Turn an Anthropic error into a sentence a user can act on. */
 export function explainAnthropicError(err: unknown): string {
-  return friendlyErrorMessage(err, 'Training into Claude failed');
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/anthropic-workspace-id|scoped to a workspace/i.test(msg)) {
+    return (
+      'Anthropic needs to know which workspace the files belong to: in Settings → API Keys enter the ' +
+      'Workspace ID ("wrkspc_…", from console.anthropic.com → Settings → Workspaces), or use an API key ' +
+      'created inside a workspace.'
+    );
+  }
+  return msg;
 }

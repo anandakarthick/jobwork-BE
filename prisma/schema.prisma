@@ -111,27 +111,6 @@ model QuotePrompt {
   @@map("quote_prompts")
 }
 
-/// One section of a brand file's catalogue INDEX, built by Claude at training time
-/// and stored in Claude as its own file: one line per product (code | description
-/// | release | poles | rating | kA | price). A quote attaches only the sections the
-/// BOQ needs. We keep just the name, a few keywords and the Claude file id.
-model KnowledgeSection {
-  id         Int      @id @default(autoincrement())
-  documentId Int      @map("document_id")
-  name       String   @db.VarChar(190)
-  /// Comma-separated product words the section covers, for the BOQ → section pick.
-  keywords   String   @db.Text
-  aiFileId   String   @map("ai_file_id") @db.VarChar(120)
-  chars      Int
-  lineCount  Int      @map("line_count")
-  createdAt  DateTime @default(now()) @map("created_at")
-
-  document ProductDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
-
-  @@index([documentId])
-  @@map("knowledge_sections")
-}
-
 /// The AI system prompts the quote pipeline runs with (BOQ extraction, rule-driven
 /// accessories, catalogue matching, chat). Editable in Settings → AI prompts; the
 /// code holds only a seed default per key, inserted the first time a key is read.
@@ -220,9 +199,6 @@ model LlmSetting {
   /// Anthropic workspace id ("wrkspc_…"). Needed for the Files API when the API
   /// key is an organisation-wide (default) key rather than a workspace-scoped one.
   anthropicWorkspaceId String? @map("anthropic_workspace_id") @db.VarChar(80)
-  /// Cheap Claude model for small jobs (picking catalogue sections for a BOQ,
-  /// classifying / answering simple chat questions). The main model does the rest.
-  anthropicFastModel   String  @default("claude-haiku-4-5-20251001") @map("anthropic_fast_model") @db.VarChar(80)
 
   // Manually-maintained credit balances. Providers don't expose remaining
   // balance via the API key, so an admin sets these and usage is subtracted.
@@ -292,9 +268,6 @@ model Quote {
   priceListDocumentId Int?        @map("price_list_document_id")
   /// Which LLM produced the draft — "openai" | "claude".
   provider            String?     @db.VarChar(40)
-  /// Knowledge engine: the catalogue-section ids attached for this quote (chat
-  /// follow-ups reuse them). Null = every section / the full files.
-  knowledgeSectionIds Json?       @map("knowledge_section_ids")
   summary             String?     @db.Text
   error               String?     @db.Text
   /// Feeder-grouped BOM (Board→Feeder→items) captured at generation for the
@@ -522,9 +495,6 @@ model ProductDocument {
   aiFileKind   String?      @map("ai_file_kind") @db.VarChar(10)
   aiPages      Int?         @map("ai_pages")
   aiTextFileId String?      @map("ai_text_file_id") @db.VarChar(120)
-  /// Catalogue index built from this file (see KnowledgeSection): when and how many.
-  aiIndexedAt    DateTime? @map("ai_indexed_at")
-  aiSectionCount Int?      @map("ai_section_count")
 
   category       ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: Cascade)
   company        Company?         @relation("CompanyPriceLists", fields: [companyId], references: [id], onDelete: SetNull)
@@ -532,7 +502,6 @@ model ProductDocument {
   priceListItems PriceListItem[]
   textChunks     ProductDocumentText[]
   quotes         Quote[]
-  sections       KnowledgeSection[]
 
   @@index([categoryId])
   @@index([companyId])
