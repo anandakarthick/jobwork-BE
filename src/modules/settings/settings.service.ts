@@ -1,11 +1,13 @@
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { spentSince } from '../../lib/llm/usage';
+import { vectorDbConfigured } from '../../lib/vector-db';
 import { DEFAULT_LETTERHEAD, LETTERHEAD_PRESETS } from '../email/letterhead';
 import type {
   UpdateAppInput,
   UpdateLetterheadInput,
   UpdateLlmInput,
+  UpdateNotificationsInput,
   UpdateSmtpInput,
 } from './settings.schema';
 
@@ -87,6 +89,52 @@ export async function updateSmtpSettings(input: UpdateSmtpInput) {
   return getSmtpSettings();
 }
 
+/** Settings → Notifications: who gets the training emails. Defaults = on, starter only. */
+export async function getNotificationSettings() {
+  const row = await prisma.notificationSetting.findUnique({ where: { id: 1 } });
+  return {
+    trainingEnabled: row?.trainingEnabled ?? true,
+    trainingRecipients: splitEmails(row?.trainingRecipients),
+    trainingNotifyStarter: row?.trainingNotifyStarter ?? true,
+    trainingOnStarted: row?.trainingOnStarted ?? true,
+    trainingOnCompleted: row?.trainingOnCompleted ?? true,
+    trainingOnFailed: row?.trainingOnFailed ?? true,
+    updatedAt: row?.updatedAt ?? null,
+  };
+}
+
+/** "a@x.com, b@y.com" → ['a@x.com', 'b@y.com'] (trimmed, lower-cased, unique). */
+export function splitEmails(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  return [...new Set(raw.split(/[,;\s]+/).map((e) => e.trim().toLowerCase()).filter(Boolean))];
+}
+
+export async function updateNotificationSettings(input: UpdateNotificationsInput) {
+  const recipients = input.trainingRecipients ? splitEmails(input.trainingRecipients.join(',')).join(', ') : undefined;
+  const update: Prisma.NotificationSettingUpdateInput = {};
+  if (input.trainingEnabled !== undefined) update.trainingEnabled = input.trainingEnabled;
+  if (recipients !== undefined) update.trainingRecipients = recipients || null;
+  if (input.trainingNotifyStarter !== undefined) update.trainingNotifyStarter = input.trainingNotifyStarter;
+  if (input.trainingOnStarted !== undefined) update.trainingOnStarted = input.trainingOnStarted;
+  if (input.trainingOnCompleted !== undefined) update.trainingOnCompleted = input.trainingOnCompleted;
+  if (input.trainingOnFailed !== undefined) update.trainingOnFailed = input.trainingOnFailed;
+
+  await prisma.notificationSetting.upsert({
+    where: { id: 1 },
+    update,
+    create: {
+      id: 1,
+      trainingEnabled: input.trainingEnabled ?? true,
+      trainingRecipients: recipients || null,
+      trainingNotifyStarter: input.trainingNotifyStarter ?? true,
+      trainingOnStarted: input.trainingOnStarted ?? true,
+      trainingOnCompleted: input.trainingOnCompleted ?? true,
+      trainingOnFailed: input.trainingOnFailed ?? true,
+    },
+  });
+  return getNotificationSettings();
+}
+
 /** App branding (project name + logo) — used across the app and login page. */
 export async function getAppSettings() {
   const row = await prisma.appSetting.findUnique({ where: { id: 1 } });
@@ -127,6 +175,8 @@ export async function getLlmSettings() {
     anthropicModel: row?.anthropicModel ?? 'claude-opus-4-8',
     quoteEngine: (row?.quoteEngine as 'database' | 'claude' | undefined) ?? 'database',
     anthropicWorkspaceId: row?.anthropicWorkspaceId ?? '',
+    pageSearch: Boolean(row?.pageSearch),
+    pageSearchAvailable: vectorDbConfigured(),
     openaiKeySet: Boolean(row?.openaiApiKey),
     anthropicKeySet: Boolean(row?.anthropicApiKey),
     openaiBalance: row?.openaiBalance != null ? Number(row.openaiBalance) : null,
@@ -183,6 +233,7 @@ export async function updateLlmSettings(input: UpdateLlmInput) {
   if (input.anthropicModel !== undefined) update.anthropicModel = input.anthropicModel;
   if (input.quoteEngine !== undefined) update.quoteEngine = input.quoteEngine;
   if (input.anthropicWorkspaceId !== undefined) update.anthropicWorkspaceId = input.anthropicWorkspaceId || null;
+  if (input.pageSearch !== undefined) update.pageSearch = input.pageSearch;
   // Setting a balance resets its "as of" instant, so spend is counted from now.
   if (input.openaiBalance !== undefined) {
     update.openaiBalance = input.openaiBalance;
@@ -210,6 +261,7 @@ export async function updateLlmSettings(input: UpdateLlmInput) {
       anthropicModel: input.anthropicModel ?? 'claude-opus-4-8',
       quoteEngine: input.quoteEngine ?? 'database',
       anthropicWorkspaceId: input.anthropicWorkspaceId || null,
+      pageSearch: input.pageSearch ?? false,
       openaiApiKey: input.clearOpenaiKey ? null : input.openaiApiKey || null,
       anthropicApiKey: input.clearAnthropicKey ? null : input.anthropicApiKey || null,
     },

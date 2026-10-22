@@ -8,6 +8,8 @@ export const updateLlmSchema = z.object({
   quoteEngine: z.enum(['database', 'claude']).optional(),
   // Anthropic workspace id ("wrkspc_…"); empty string clears it.
   anthropicWorkspaceId: z.string().trim().max(80).optional(),
+  // Claude engine: send only the matching price-list pages (pgvector) instead of whole files.
+  pageSearch: z.coerce.boolean().optional(),
   // Keys: provide a value to set; omit or leave empty to keep the current one.
   openaiApiKey: z.string().max(500).optional(),
   anthropicApiKey: z.string().max(500).optional(),
@@ -45,6 +47,18 @@ export const updateSmtpSchema = z.object({
 });
 
 export type UpdateSmtpInput = z.infer<typeof updateSmtpSchema>;
+
+/** Settings → Notifications (training emails). Recipients: a list of addresses. */
+export const updateNotificationsSchema = z.object({
+  trainingEnabled: z.coerce.boolean().optional(),
+  trainingRecipients: z.array(z.string().trim().email()).max(50).optional(),
+  trainingNotifyStarter: z.coerce.boolean().optional(),
+  trainingOnStarted: z.coerce.boolean().optional(),
+  trainingOnCompleted: z.coerce.boolean().optional(),
+  trainingOnFailed: z.coerce.boolean().optional(),
+});
+
+export type UpdateNotificationsInput = z.infer<typeof updateNotificationsSchema>;
 
 export const updateLetterheadSchema = z.object({
   // HTML design (letter-pad shell). ~1MB cap is ample for an inline-styled shell.

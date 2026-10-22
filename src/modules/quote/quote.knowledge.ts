@@ -12,12 +12,29 @@
  *
  * Chat follow-ups reuse the same files: a question is answered, a change comes
  * back as the complete updated BOM and is verified the same way.
+ *
+ * PAGE SEARCH (Settings → API Keys, needs the pgvector index): instead of the
+ * whole price-list files, only the pages this BOQ needs are sent (see
+ * vectors/vector.select.ts) — same prompts, same rules, same verification
+ * against the complete files. Lines left without a product are searched by
+ * their own words and priced in a small fill-in request (just those lines).
+ * When any file is not indexed (or the search fails) the whole files are
+ * attached exactly as before.
  */
 import type { LlmMessage, LlmProvider } from '../../lib/llm';
 import { HttpError } from '../../lib/http-error';
 import { getPromptText } from '../prompts/prompt.service';
 import { knowledgeFilesForBrands, selectKnowledgeFileIds, transientBrandText } from '../companies/knowledge.service';
 import type { BomBoard } from './quote.bom';
+import {
+  pageSearchReady,
+  pagesAsText,
+  pagesForLines,
+  selectChatPages,
+  selectQuotePages,
+  type PageSelection,
+} from '../vectors/vector.select';
+import type { RetrievedPage } from '../vectors/vector.service';
 
 export interface KnowledgeItem {
   requirement: string;
@@ -70,6 +87,8 @@ export interface KnowledgeResult {
   total: number;
   /** Items whose code/price could not be found in the files (voided). */
   voided: string[];
+  /** Page search: what was sent instead of the whole files (null = whole files). */
+  pagesSent?: { pages: number; totalPages: number; chars: number; plannedSections: number } | null;
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
@@ -99,10 +118,14 @@ export async function requireKnowledgeFiles(brands: string[]) {
  * Anything that fails is voided (code/price cleared, note says why) — the quote
  * never carries an invented code or price.
  */
-export function verifyAgainstText(boards: KnowledgeBoard[], text: string): { boards: KnowledgeBoard[]; voided: string[] } {
+export function verifyAgainstText(
+  boards: KnowledgeBoard[],
+  text: string,
+): { boards: KnowledgeBoard[]; voided: string[]; voidedItems: KnowledgeItem[] } {
   const hay = text.replace(/\s+/g, ' ');
   const hayLower = hay.toLowerCase();
   const voided: string[] = [];
+  const voidedItems: KnowledgeItem[] = [];
   const priceForms = (p: number) => {
     const n = Math.round(p);
     const forms = new Set<string>([String(n), n.toLocaleString('en-IN'), n.toLocaleString('en-US')]);
@@ -120,6 +143,7 @@ export function verifyAgainstText(boards: KnowledgeBoard[], text: string): { boa
         let idx = hayLower.indexOf(code.toLowerCase());
         if (idx < 0) {
           voided.push(`${code} (${it.description || it.requirement})`);
+          voidedItems.push(it);
           it.note = `Not found in price list – manual verification required – "${code}" is not in the brand files. ${it.note ?? ''}`.trim();
           it.catalogNo = null;
           it.listPrice = null;
@@ -136,6 +160,7 @@ export function verifyAgainstText(boards: KnowledgeBoard[], text: string): { boa
           }
           if (!ok) {
             voided.push(`${code} price ${it.listPrice}`);
+            voidedItems.push(it);
             it.note = `Price not confirmed in the price list – manual verification required. ${it.note ?? ''}`.trim();
             it.listPrice = null;
           }
@@ -143,7 +168,7 @@ export function verifyAgainstText(boards: KnowledgeBoard[], text: string): { boa
       }
     }
   }
-  return { boards, voided };
+  return { boards, voided, voidedItems };
 }
 
 /** Sanitise the model's JSON into typed boards (missing fields defaulted). */
@@ -260,15 +285,81 @@ async function finishBoards(
   files: Awaited<ReturnType<typeof knowledgeFilesForBrands>>,
   defaultDiscountPct: number,
   summary: string,
+  /** Page search: price the lines still open from more pages (mutates the boards). */
+  fill?: (boards: KnowledgeBoard[]) => Promise<void>,
 ): Promise<KnowledgeResult> {
   const boards = normaliseBoards(rawBoards);
   if (!boards.length) throw HttpError.badRequest('Claude returned no bill of materials for this BOQ.');
   const text = await transientBrandText(files);
-  const { voided } = verifyAgainstText(boards, text);
+  const first = verifyAgainstText(boards, text);
+  let voided = first.voided;
+  if (fill) {
+    await fill(boards).catch((err) => console.warn('[page search] fill-in failed:', (err as Error).message));
+    // Re-verify (the filled codes too); a first-pass notice stays only while its line is still open.
+    const second = verifyAgainstText(boards, text);
+    voided = [
+      ...first.voided.filter((_, i) => !first.voidedItems[i]!.catalogNo || first.voidedItems[i]!.listPrice == null),
+      ...second.voided,
+    ];
+  }
   const { bom, lines } = toQuoteShape(boards, defaultDiscountPct);
   const total = lines.length;
   const matched = lines.filter((l) => l.catalogNo).length;
   return { boards: bom, lines, summary, matched, total, voided };
+}
+
+/**
+ * Page search fill-in: the lines left without a product are searched by their
+ * own words; the pages found that were not sent yet go to Claude with the rules
+ * and just those lines, and the codes it returns are written into the BOM. Only
+ * the open lines are answered, so this costs a fraction of asking again.
+ */
+async function fillOpenLines(opts: {
+  provider: LlmProvider;
+  files: KnowledgeFiles;
+  boards: KnowledgeBoard[];
+  have: RetrievedPage[];
+  ruleFileIds: string[];
+  rulesText: string;
+  brands: string[];
+  /** Lines to leave alone (chat: lines that were already open before the change). */
+  skip?: (it: KnowledgeItem) => boolean;
+  onProgress?: GenerateInput['onProgress'];
+}): Promise<void> {
+  const open: { ref: string; it: KnowledgeItem; board: string; feeder: string }[] = [];
+  for (const b of opts.boards)
+    for (const f of b.feeders)
+      for (const it of f.items)
+        if (!it.catalogNo && !opts.skip?.(it)) open.push({ ref: `L${open.length + 1}`, it, board: b.name, feeder: f.name });
+  if (!open.length) return;
+  const texts = [...new Set(open.map((o) => [o.it.description, o.it.requirement].filter(Boolean).join(' — ')))];
+  const more = await pagesForLines({ docs: opts.files, have: opts.have, lineTexts: texts });
+  if (!more.length) return;
+  opts.onProgress?.('extract', `Claude is pricing ${open.length} open line(s) from ${more.length} more price-list page(s)`);
+  const system = await getPromptText('quote.pages.fill');
+  const user =
+    `BRANDS: ${opts.brands.join(', ')}\n` +
+    (opts.ruleFileIds.length ? `BRAND RULES: ${opts.ruleFileIds.length} rule file(s) are attached.\n` : '') +
+    (opts.rulesText.trim() ? `BRAND RULES (text):\n${opts.rulesText.trim()}\n` : '') +
+    `\nLINES:\n${JSON.stringify(
+      open.map((o) => ({ ref: o.ref, panel: o.board, feeder: o.feeder, requirement: o.it.requirement, description: o.it.description, qty: o.it.qty })),
+    )}`;
+  const raw = await opts.provider.completeWithKnowledge!(
+    { fileIds: opts.ruleFileIds, contextText: await pagesAsText(opts.files, more), messages: [{ role: 'user', content: user }] },
+    { system, json: true, maxTokens: 16000, label: 'quote:pages-fill' },
+  );
+  const answer = parseJson<{ items?: unknown }>(raw);
+  const byRef = new Map(open.map((o) => [o.ref, o.it]));
+  for (const a of (Array.isArray(answer.items) ? answer.items : []) as Record<string, unknown>[]) {
+    const it = byRef.get(String(a.ref ?? ''));
+    const code = a.catalogNo != null ? String(a.catalogNo).trim() : '';
+    if (!it || !code) continue;
+    it.catalogNo = code.slice(0, 120);
+    const price = Number(a.listPrice);
+    it.listPrice = a.listPrice != null && a.listPrice !== '' && Number.isFinite(price) ? price : null;
+    if (a.description) it.description = String(a.description).trim().slice(0, 500);
+    it.note = String(a.note ?? '').trim().slice(0, 1000);
+  }
 }
 
 export interface GenerateInput {
@@ -282,7 +373,37 @@ export interface GenerateInput {
   boqText: string;
   customerName: string;
   defaultDiscountPct: number;
+  /** Send only the matching price-list pages (Settings → API Keys) when the index is ready. */
+  pageSearch?: boolean;
+  /** Every chosen rule's text — the page search reads it (trained rules still go by file id). */
+  rulesAllText?: string;
   onProgress?: (stage: 'collect' | 'extract' | 'assemble', detail: string) => void;
+}
+
+type KnowledgeFiles = Awaited<ReturnType<typeof knowledgeFilesForBrands>>;
+
+/** Pages in the brand files (for "sent 44 of 204 pages"). */
+function totalPagesOf(files: KnowledgeFiles): number {
+  return files.reduce((s, f) => s + (f.aiPages ?? 0), 0);
+}
+
+/** The page search's choice for a quote, or null → attach the whole files. */
+async function quotePages(input: GenerateInput, files: KnowledgeFiles): Promise<PageSelection | null> {
+  if (!input.pageSearch || !(await pageSearchReady(files))) return null;
+  input.onProgress?.('collect', 'Finding the price-list pages this BOQ and the rules need');
+  try {
+    const sel = await selectQuotePages({
+      provider: input.provider,
+      docs: files,
+      boqText: input.boqText,
+      rulesText: input.rulesAllText ?? input.rulesText,
+      customerNotes: input.customerNotes,
+    });
+    return sel.pages.length ? sel : null;
+  } catch (err) {
+    console.warn('[page search] falling back to the whole files:', (err as Error).message);
+    return null;
+  }
 }
 
 /** One request → the complete, verified BOM. */
@@ -305,14 +426,53 @@ export async function generateWithKnowledge(input: GenerateInput): Promise<Knowl
     (input.customerNotes.trim() ? `CUSTOMER MESSAGE:\n${input.customerNotes.trim()}\n\n` : '') +
     `BOQ (bill of quantities):\n${input.boqText.slice(0, 160_000)}\n\n` +
     'Produce the complete JSON described in your instructions.';
-  input.onProgress?.('extract', `Claude is reading ${files.length} price-list file(s), ${input.ruleFileIds.length} rule file(s) and the BOQ`);
-  const raw = await input.provider.completeWithKnowledge(
-    { fileIds: [...selectKnowledgeFileIds(files).fileIds, ...input.ruleFileIds], messages: [{ role: 'user', content: user }] },
-    { system, json: true, maxTokens: 24000, label: 'quote:knowledge' },
+  const selection = await quotePages(input, files);
+  const ask = async (pages: RetrievedPage[] | null) => {
+    const raw = await input.provider.completeWithKnowledge!(
+      pages
+        ? { fileIds: input.ruleFileIds, contextText: await pagesAsText(files, pages), messages: [{ role: 'user', content: user }] }
+        : { fileIds: [...selectKnowledgeFileIds(files).fileIds, ...input.ruleFileIds], messages: [{ role: 'user', content: user }] },
+      { system, json: true, maxTokens: 24000, label: pages ? 'quote:knowledge-pages' : 'quote:knowledge' },
+    );
+    const parsed = parseJson<{ summary?: string; boards?: unknown }>(raw);
+    input.onProgress?.('assemble', 'Verifying every code and price against the brand files');
+    const fill = pages
+      ? (boards: KnowledgeBoard[]) =>
+          fillOpenLines({
+            provider: input.provider,
+            files,
+            boards,
+            have: pages,
+            ruleFileIds: input.ruleFileIds,
+            rulesText: input.rulesText,
+            brands: input.brands,
+            onProgress: input.onProgress,
+          })
+      : undefined;
+    return finishBoards(parsed.boards, files, input.defaultDiscountPct, String(parsed.summary ?? '').slice(0, 2000), fill);
+  };
+
+  if (!selection) {
+    input.onProgress?.('extract', `Claude is reading ${files.length} price-list file(s), ${input.ruleFileIds.length} rule file(s) and the BOQ`);
+    return { ...(await ask(null)), pagesSent: null };
+  }
+  const totalPages = totalPagesOf(files);
+  input.onProgress?.(
+    'extract',
+    `Claude is reading ${selection.pages.length} of ${totalPages} price-list pages, ${input.ruleFileIds.length} rule file(s) and the BOQ`,
   );
-  const parsed = parseJson<{ summary?: string; boards?: unknown }>(raw);
-  input.onProgress?.('assemble', 'Verifying every code and price against the brand files');
-  return finishBoards(parsed.boards, files, input.defaultDiscountPct, String(parsed.summary ?? '').slice(0, 2000));
+  // One full request, then a small fill-in for any line left open. (Asking for the
+  // whole BOM a second time was tried and dropped: the answer is the costly part.)
+  const result = await ask(selection.pages);
+  return {
+    ...result,
+    pagesSent: {
+      pages: selection.pages.length,
+      totalPages,
+      chars: selection.chars,
+      plannedSections: selection.plannedSections,
+    },
+  };
 }
 
 export interface ChatInput {
@@ -325,6 +485,8 @@ export interface ChatInput {
   history: LlmMessage[];
   message: string;
   defaultDiscountPct: number;
+  /** Send only the matching price-list pages (Settings → API Keys) when the index is ready. */
+  pageSearch?: boolean;
 }
 
 export interface ChatResult {
@@ -374,15 +536,51 @@ export async function chatWithKnowledge(input: ChatInput): Promise<ChatResult> {
     ...input.history.filter((m) => m.role !== 'system' && m.content.trim()),
     { role: 'user', content: input.message },
   ];
-  const raw = await input.provider.completeWithKnowledge(
-    { fileIds: [...selectKnowledgeFileIds(files).fileIds, ...input.ruleFileIds], messages },
-    { system, json: true, maxTokens: 24000, label: 'quote:knowledge-chat' },
-  );
-  const parsed = parseJson<{ reply?: string; bom?: unknown; fileName?: string | null }>(raw);
-  const reply = String(parsed.reply ?? '').trim().slice(0, 2000);
-  const result =
-    Array.isArray(parsed.bom) && parsed.bom.length
-      ? await finishBoards(parsed.bom, files, input.defaultDiscountPct, reply)
-      : null;
-  return { reply, fileName: parsed.fileName ? String(parsed.fileName) : null, result };
+  // Page search: the pages of the current BOM's products + the best pages for the message.
+  let pages: RetrievedPage[] | null = null;
+  if (input.pageSearch && (await pageSearchReady(files))) {
+    const codes = (input.currentBoards ?? [])
+      .flatMap((b) => b.feeders.flatMap((f) => f.items.map((it) => it.modelNo ?? '')))
+      .filter(Boolean);
+    pages = await selectChatPages({ docs: files, codes, message: input.message })
+      .then((sel) => (sel.pages.length ? sel.pages : null))
+      .catch((err) => {
+        console.warn('[page search] chat falls back to the whole files:', (err as Error).message);
+        return null;
+      });
+  }
+  const ask = async (pg: RetrievedPage[] | null): Promise<ChatResult> => {
+    const raw = await input.provider.completeWithKnowledge!(
+      pg
+        ? { fileIds: input.ruleFileIds, contextText: await pagesAsText(files, pg), messages }
+        : { fileIds: [...selectKnowledgeFileIds(files).fileIds, ...input.ruleFileIds], messages },
+      { system, json: true, maxTokens: 24000, label: pg ? 'quote:knowledge-chat-pages' : 'quote:knowledge-chat' },
+    );
+    const parsed = parseJson<{ reply?: string; bom?: unknown; fileName?: string | null }>(raw);
+    const reply = String(parsed.reply ?? '').trim().slice(0, 2000);
+    const openBefore = new Set(
+      (input.currentBoards ?? []).flatMap((b) =>
+        b.feeders.flatMap((f) => f.items.filter((it) => !it.modelNo).map((it) => it.description.trim().toLowerCase())),
+      ),
+    );
+    const fill = pg
+      ? (boards: KnowledgeBoard[]) =>
+          fillOpenLines({
+            provider: input.provider,
+            files,
+            boards,
+            have: pg,
+            ruleFileIds: input.ruleFileIds,
+            rulesText: input.rulesText,
+            brands: input.brands,
+            skip: (it) => openBefore.has(it.description.trim().toLowerCase()),
+          })
+      : undefined;
+    const result =
+      Array.isArray(parsed.bom) && parsed.bom.length
+        ? await finishBoards(parsed.bom, files, input.defaultDiscountPct, reply, fill)
+        : null;
+    return { reply, fileName: parsed.fileName ? String(parsed.fileName) : null, result };
+  };
+  return ask(pages);
 }

@@ -220,10 +220,10 @@ export async function addPriceLists(
 }
 
 /** Train one brand file into Claude (upload its text to Anthropic's Files API). */
-export async function trainPriceListIntoClaude(companyId: number, docId: number) {
+export async function trainPriceListIntoClaude(companyId: number, docId: number, userId: number | null = null) {
   const doc = await prisma.productDocument.findFirst({ where: { id: docId, companyId } });
   if (!doc) throw HttpError.notFound('Price list not found');
-  await startClaudeTraining(docId);
+  await startClaudeTraining(docId, userId);
   return prisma.productDocument.findUniqueOrThrow({ where: { id: docId }, select: priceListSelect });
 }
 

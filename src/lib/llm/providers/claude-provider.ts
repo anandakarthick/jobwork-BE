@@ -75,7 +75,12 @@ export function createClaudeProvider(cfg: LlmConfig): LlmProvider {
       await recordUsage({
         provider: 'claude',
         model: cfg.anthropicModel,
-        inputTokens: resp.usage?.input_tokens ?? 0,
+        inputTokens:
+          (resp.usage?.input_tokens ?? 0) +
+          (resp.usage?.cache_read_input_tokens ?? 0) +
+          (resp.usage?.cache_creation_input_tokens ?? 0),
+        cacheReadTokens: resp.usage?.cache_read_input_tokens ?? 0,
+        cacheWriteTokens: resp.usage?.cache_creation_input_tokens ?? 0,
         outputTokens: resp.usage?.output_tokens ?? 0,
         feature: opts.label,
       });
@@ -160,14 +165,17 @@ export function createClaudeProvider(cfg: LlmConfig): LlmProvider {
       const firstUser = turns.findIndex((m) => m.role === 'user');
       const messages: Anthropic.Beta.Messages.BetaMessageParam[] = turns.map((m, i) => {
         if (i !== firstUser) return { role: m.role as 'user' | 'assistant', content: m.content };
-        // Files + the first user text. Cache breakpoint on the last file so the
-        // whole file prefix is cached (max 4 breakpoints: system + here is enough).
-        const files: Anthropic.Beta.Messages.BetaContentBlockParam[] = input.fileIds.map((id, k) => ({
+        // Files (+ the chosen price-list pages) + the first user text. Cache
+        // breakpoint on the last of them so the whole prefix is cached (max 4
+        // breakpoints: system + here is enough).
+        const blocks: Anthropic.Beta.Messages.BetaContentBlockParam[] = input.fileIds.map((id) => ({
           type: 'document' as const,
           source: { type: 'file' as const, file_id: id },
-          ...(k === input.fileIds.length - 1 ? { cache_control: { type: 'ephemeral' as const } } : {}),
         }));
-        return { role: 'user' as const, content: [...files, { type: 'text' as const, text: m.content }] };
+        if (input.contextText?.trim()) blocks.push({ type: 'text' as const, text: input.contextText });
+        const last = blocks.at(-1);
+        if (last && (last.type === 'document' || last.type === 'text')) last.cache_control = { type: 'ephemeral' as const };
+        return { role: 'user' as const, content: [...blocks, { type: 'text' as const, text: m.content }] };
       });
 
       // Price lists of several brands can exceed the standard window — ask for the
@@ -218,6 +226,8 @@ export function createClaudeProvider(cfg: LlmConfig): LlmProvider {
             (resp.usage?.input_tokens ?? 0) +
             (resp.usage?.cache_read_input_tokens ?? 0) +
             (resp.usage?.cache_creation_input_tokens ?? 0),
+          cacheReadTokens: resp.usage?.cache_read_input_tokens ?? 0,
+          cacheWriteTokens: resp.usage?.cache_creation_input_tokens ?? 0,
           outputTokens: resp.usage?.output_tokens ?? 0,
           feature: opts.label,
         });

@@ -108,6 +108,8 @@ export interface LlmProvider {
 export interface KnowledgeInput {
   /** Provider file ids (Anthropic Files API) attached to the FIRST user turn. */
   fileIds: string[];
+  /** Price-list pages sent as text after the files (page search), instead of whole files. */
+  contextText?: string;
   /** Conversation; the first user turn carries the files, the rest follow. */
   messages: LlmMessage[];
 }

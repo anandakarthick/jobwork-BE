@@ -183,6 +183,24 @@ model SmtpSetting {
   @@map("smtp_settings")
 }
 
+/// Singleton (id = 1): who receives the automatic notification emails
+/// (Settings → Notifications). Training = brand price-list files trained into Claude.
+model NotificationSetting {
+  id                 Int      @id @default(1)
+  /// Master switch for the training emails.
+  trainingEnabled    Boolean  @default(true) @map("training_enabled")
+  /// Fixed recipients, comma-separated email addresses (may be empty).
+  trainingRecipients String?  @map("training_recipients") @db.Text
+  /// Also email the user who clicked Train (fallback: the uploader).
+  trainingNotifyStarter Boolean @default(true) @map("training_notify_starter")
+  trainingOnStarted  Boolean  @default(true) @map("training_on_started")
+  trainingOnCompleted Boolean @default(true) @map("training_on_completed")
+  trainingOnFailed   Boolean  @default(true) @map("training_on_failed")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  @@map("notification_settings")
+}
+
 /// Singleton (id = 1) holding the active LLM provider + credentials, editable
 /// by admins from Settings. Provider-neutral: works for OpenAI or Claude.
 model LlmSetting {
@@ -199,6 +217,9 @@ model LlmSetting {
   /// Anthropic workspace id ("wrkspc_…"). Needed for the Files API when the API
   /// key is an organisation-wide (default) key rather than a workspace-scoped one.
   anthropicWorkspaceId String? @map("anthropic_workspace_id") @db.VarChar(80)
+  /// Claude engine: send only the price-list pages that match the BOQ (found with
+  /// the pgvector search) instead of attaching the whole files. Off = whole files.
+  pageSearch      Boolean  @default(false) @map("page_search")
 
   // Manually-maintained credit balances. Providers don't expose remaining
   // balance via the API key, so an admin sets these and usage is subtracted.

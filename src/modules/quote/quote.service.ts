@@ -342,7 +342,9 @@ function knowledgeReply(result: KnowledgeResult, brands: string[], ruleNames: st
       : '') +
     `\n\nApplied: ` +
     (ruleNames.length ? `rules ${ruleNames.join(', ')}` : 'no brand rules') +
-    `; brand files trained into Claude.` +
+    (result.pagesSent
+      ? `; ${result.pagesSent.pages} of ${result.pagesSent.totalPages} price-list pages (page search).`
+      : `; brand files trained into Claude.`) +
     `\n\nAsk me to adjust quantities, swap a part, or explain any line.`
   );
 }
@@ -358,7 +360,8 @@ async function processQuote(quoteId: number, input: CreateQuoteInput, files: Sto
     }
 
     // ── Engine "claude": the brand files live in Claude; one request → the BOM.
-    if ((await getEffectiveLlmConfig()).quoteEngine === 'claude') {
+    const llmCfg = await getEffectiveLlmConfig();
+    if (llmCfg.quoteEngine === 'claude') {
       const brands = parseBrands(input.brand);
       const promptIds = input.promptIds ?? null;
       setProgress(quoteId, 'read', `Reading ${files.map((f) => f.originalName).join(', ')}`);
@@ -373,6 +376,8 @@ async function processQuote(quoteId: number, input: CreateQuoteInput, files: Sto
         brands,
         ruleFileIds: rules.fileIds,
         rulesText: rules.inlineText,
+        rulesAllText: rules.allText,
+        pageSearch: llmCfg.pageSearch,
         customerNotes: input.message ?? '',
         boqText,
         customerName: customer?.name ?? '',
@@ -1019,7 +1024,8 @@ export async function addQuoteMessage(
   // ── Engine "claude": the brand files are attached to every turn. A new BOQ or
   // "regenerate" produces a fresh BOM; anything else is a question or a change
   // that Claude answers with the complete updated BOM (verified before saving).
-  if ((await getEffectiveLlmConfig()).quoteEngine === 'claude' && provider.name !== 'stub') {
+  const llmCfg = await getEffectiveLlmConfig();
+  if (llmCfg.quoteEngine === 'claude' && provider.name !== 'stub') {
     const brands = parseBrands(quote.brand);
     const rules = await knowledgeRulesForQuote(brands, quotePromptIds(quote));
     const ruleNames = (await listPromptsForBrands(brands))
@@ -1043,6 +1049,8 @@ export async function addQuoteMessage(
           brands,
           ruleFileIds: rules.fileIds,
           rulesText: rules.inlineText,
+          rulesAllText: rules.allText,
+          pageSearch: llmCfg.pageSearch,
           customerNotes: content.trim(),
           boqText,
           customerName: quote.customer.name,
@@ -1070,6 +1078,7 @@ export async function addQuoteMessage(
         history: quote.messages.map((m) => ({ role: m.role.toLowerCase() as LlmMessage['role'], content: m.content })),
         message: content || (attachments.length ? '(see attached files)' : ''),
         defaultDiscountPct: 0,
+        pageSearch: llmCfg.pageSearch,
       });
       let changed = false;
       const dl = chat.fileName ? safeName(chat.fileName) : null;

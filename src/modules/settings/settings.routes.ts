@@ -6,10 +6,12 @@ import {
   updateAppSchema,
   updateLetterheadSchema,
   updateLlmSchema,
+  updateNotificationsSchema,
   updateSmtpSchema,
 } from './settings.schema';
 import * as settingsService from './settings.service';
 import * as promptService from '../prompts/prompt.service';
+import { sendTrainingSample } from '../email/training.emails';
 
 export const settingsRouter = Router();
 
@@ -74,6 +76,33 @@ settingsRouter.put(
   validate(updateSmtpSchema),
   asyncHandler(async (req, res) => {
     res.json(await settingsService.updateSmtpSettings(req.body));
+  }),
+);
+
+// Notifications (training emails): who receives them and for which events.
+settingsRouter.get(
+  '/notifications',
+  requirePermission('settings.view'),
+  asyncHandler(async (_req, res) => {
+    res.json(await settingsService.getNotificationSettings());
+  }),
+);
+
+settingsRouter.put(
+  '/notifications',
+  requirePermission('settings.edit'),
+  validate(updateNotificationsSchema),
+  asyncHandler(async (req, res) => {
+    res.json(await settingsService.updateNotificationSettings(req.body));
+  }),
+);
+
+// Send a sample "Training completed" email to the SAVED recipients (+ the caller).
+settingsRouter.post(
+  '/notifications/test-training',
+  requirePermission('settings.edit'),
+  asyncHandler(async (req, res) => {
+    res.json(await sendTrainingSample(req.user!.sub));
   }),
 );
 

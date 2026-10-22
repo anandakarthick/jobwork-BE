@@ -96,6 +96,63 @@ export const PROMPT_DEFAULTS = {
       'list); "bom" is null when nothing changes; "fileName" only when the user asks to rename the download.',
     ].join('\n'),
   },
+  'quote.pages.select': {
+    name: 'Price-list search — choose the sections',
+    description:
+      'Used when "Send only the matching price-list pages" is on: before the quote, Claude reads the OUTLINE of the brand\'s price lists (each section\'s heading, pages and opening text — built from the files themselves), the selected rules and the BOQ, and names the sections the quote will need. Only those sections (plus the best search matches) are sent with the quote.',
+    content: [
+      'You plan which parts of the brand\'s price lists a quotation needs. You receive the OUTLINE',
+      'of the price lists — every section with its id, file, pages, heading and opening text —',
+      'then the BRAND RULES chosen for this quote and the customer\'s BOQ.',
+      '',
+      'Name every section that the quotation will have to read to price the BOQ by the rules:',
+      '- the sections holding each product the BOQ asks for, in every rating / size / type the BOQ',
+      '  mentions;',
+      '- the sections holding everything the RULES add or decide (accessories, add-on parts,',
+      '  alternative series, the tables that the rules point to for a choice);',
+      '- ordering-code, suffix or selection tables that those products\' catalogue numbers depend on.',
+      'When unsure whether a section is needed, include it — a missing section means a product',
+      'cannot be priced. Do not include sections that nothing in the BOQ or the rules needs.',
+      '',
+      'Also list "items": every distinct product the quotation will contain — each BOQ device and',
+      'every item the rules add to it — as a short search phrase in the price list\'s own words',
+      '(product type, series / family if the rules or the outline name one, rating, poles,',
+      'breaking capacity, size, colour, voltage). One phrase per distinct product; these phrases are',
+      'searched in the price lists to find the pages, so be specific.',
+      '',
+      'Return ONLY JSON: { "sections": ["S1", "S7", ...], "items": ["...", "..."] }',
+    ].join('\n'),
+  },
+  'quote.pages.fill': {
+    name: 'Price-list search — price the lines left open',
+    description:
+      'Used with "Send only the matching price-list pages": after the quote, the lines Claude could not price from the pages it had are searched again; the pages found (not sent before), the rules and those lines are sent here, and Claude returns codes and prices for just those lines.',
+    content: [
+      'You complete a quotation. Some LINES of the bill of materials could not be priced because the',
+      'pages holding their products were not available. Below are MORE PRICE-LIST PAGES of the brand,',
+      'the BRAND RULES and those LINES (each with its ref, panel, feeder, requirement, description).',
+      '',
+      'For each line, apply the rules and take the product only from these pages — copy catalogNo and',
+      'listPrice exactly as printed (the code verifies them against the files). If a line\'s product is',
+      'not on these pages, return it with catalogNo null. Do not change quantities.',
+      '',
+      'Return ONLY JSON: { "items": [ { "ref": string, "catalogNo": string|null, "listPrice": number|null,',
+      '"description": string, "note": string } ] } — "note" = the status wording the rules prescribe,',
+      'then the BOQ fact / rule behind the choice.',
+    ].join('\n'),
+  },
+  'quote.pages.note': {
+    name: 'Price-list search — note on the pages sent',
+    description:
+      'Placed before the price-list pages when only the matching pages are sent (instead of the whole files), so Claude knows what it is reading.',
+    content: [
+      'PRICE-LIST PAGES: the pages of the brand\'s price lists that hold the products this BOQ and',
+      'the rules need, chosen from the complete files (each page is marked with its file and page',
+      'number). Treat them exactly as the attached price-list files: take every catalogNo and',
+      'listPrice only from them. If a product you need is not on these pages, list it with',
+      'catalogNo null and listPrice null — the missing pages are then looked up and sent.',
+    ].join('\n'),
+  },
 } satisfies Record<string, PromptDefault>;
 
 export type PromptKey = keyof typeof PROMPT_DEFAULTS;

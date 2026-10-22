@@ -23,6 +23,9 @@ export const env = {
   // Where uploaded job-work documents are stored on disk.
   uploadDir: process.env.UPLOAD_DIR ?? 'uploads',
 
+  // PostgreSQL + pgvector: the price-list page search (optional — unset = off).
+  vectorDatabaseUrl: process.env.VECTOR_DATABASE_URL ?? '',
+
   // LLM provider config. Provider-neutral: pick 'openai' or 'claude' later.
   // Left unset for now → falls back to the built-in 'stub' provider so the
   // whole flow works end-to-end without any API key.

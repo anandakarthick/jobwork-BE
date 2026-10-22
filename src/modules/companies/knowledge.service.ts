@@ -20,6 +20,24 @@ import {
 } from '../../lib/llm/anthropic-files';
 import { readDocumentText, readPdfTextWithOcr } from '../price-list/price-list.text';
 import { isPdf } from '../price-list/price-list.ai';
+import { forgetDocumentVectors, indexDocumentVectors } from '../vectors/vector.service';
+import { vectorDbConfigured } from '../../lib/vector-db';
+import { sendTrainingEmail, type TrainingEmailInput } from '../email/training.emails';
+
+/**
+ * Who started a file's training and when — for the notification emails
+ * (started / completed / failed). Kept in memory: a restart is reported by
+ * failInterruptedClaudeTraining() to the file's uploader instead.
+ */
+const trainingStarts = new Map<number, { userId: number | null; startedAt: Date }>();
+
+/** The document fields the training emails show. */
+const emailDocSelect = { id: true, companyId: true, brand: true, name: true, fileName: true, createdById: true } as const;
+
+/** Fire-and-forget notification; never delays or breaks the training. */
+function notify(input: TrainingEmailInput): void {
+  void sendTrainingEmail(input).catch(() => undefined);
+}
 
 /** The name the file carries inside Claude: "<brand> — <label> (<file>).txt". */
 function knowledgeFileName(brand: string, label: string | null, fileName: string): string {
@@ -51,12 +69,16 @@ export function whenTrainingIdle(): Promise<void> {
  * Train one brand file into Claude in the background. aiStatus goes
  * PROCESSING → COMPLETED (with the file id) or FAILED (with the reason).
  */
-export async function startClaudeTraining(documentId: number): Promise<void> {
+export async function startClaudeTraining(documentId: number, userId: number | null = null): Promise<void> {
   await anthropicKey(); // fail fast, before marking anything
-  await prisma.productDocument.update({
+  const doc = await prisma.productDocument.update({
     where: { id: documentId },
     data: { aiStatus: 'PROCESSING', aiError: null },
+    select: emailDocSelect,
   });
+  const startedAt = new Date();
+  trainingStarts.set(documentId, { userId, startedAt });
+  notify({ event: 'STARTED', document: doc, userId, startedAt });
   queue = queue.then(() => runClaudeTraining(documentId)).catch(() => undefined);
 }
 
@@ -71,6 +93,9 @@ export async function startClaudeTraining(documentId: number): Promise<void> {
 async function runClaudeTraining(documentId: number): Promise<void> {
   const doc = await prisma.productDocument.findUnique({ where: { id: documentId } });
   if (!doc) return;
+  const start = trainingStarts.get(documentId) ?? { userId: null, startedAt: new Date() };
+  trainingStarts.delete(documentId);
+  const emailBase = { document: doc, userId: start.userId, startedAt: start.startedAt };
   try {
     const auth = await anthropicKey();
     const src = { fileName: doc.fileName, mimeType: doc.mimeType, path: doc.storagePath };
@@ -113,21 +138,51 @@ async function runClaudeTraining(documentId: number): Promise<void> {
         aiTrainedAt: new Date(),
       },
     });
+    const result = {
+      pages,
+      chars: text.length,
+      ocrPages: ocr?.ocrPages ?? 0,
+      ocrImages: ocr?.ocrImages ?? 0,
+    };
+    // Page search: index the same text (local embeddings, no API cost). Quotes use
+    // the whole files until this index matches the new training.
+    if (vectorDbConfigured()) {
+      try {
+        const index = await indexDocumentVectors({ ...doc, aiFileId: uploaded.id }, text);
+        notify({ event: 'COMPLETED', ...emailBase, finishedAt: new Date(), ...result, index });
+      } catch (err) {
+        const message = (err as Error).message;
+        console.warn(`[vectors] indexing document ${documentId} failed:`, message);
+        // The file IS trained; only the page-search index is missing. Say so.
+        notify({
+          event: 'FAILED',
+          warning: true,
+          ...emailBase,
+          finishedAt: new Date(),
+          ...result,
+          error: `Page-search index could not be built: ${message}`,
+        });
+      }
+    } else {
+      notify({ event: 'COMPLETED', ...emailBase, finishedAt: new Date(), ...result, index: null });
+    }
   } catch (err) {
+    const reason = explainAnthropicError(err).slice(0, 2000);
     await prisma.productDocument.update({
       where: { id: documentId },
-      data: { aiStatus: 'FAILED', aiError: explainAnthropicError(err).slice(0, 2000) },
+      data: { aiStatus: 'FAILED', aiError: reason },
     });
+    notify({ event: 'FAILED', ...emailBase, finishedAt: new Date(), error: reason });
   }
 }
 
 /** Train every "Train"-ticked file of a brand into Claude. */
-export async function trainBrandIntoClaude(companyId: number): Promise<number> {
+export async function trainBrandIntoClaude(companyId: number, userId: number | null = null): Promise<number> {
   const docs = await prisma.productDocument.findMany({
     where: { companyId, kind: 'PRICE_LIST', train: true },
     select: { id: true },
   });
-  for (const d of docs) await startClaudeTraining(d.id);
+  for (const d of docs) await startClaudeTraining(d.id, userId);
   return docs.length;
 }
 
@@ -137,6 +192,7 @@ export async function forgetClaudeFile(documentId: number): Promise<void> {
     where: { id: documentId },
     select: { aiFileId: true, aiTextFileId: true },
   });
+  await forgetDocumentVectors(documentId).catch(() => undefined);
   if (!doc?.aiFileId && !doc?.aiTextFileId) return;
   const cfg = await getEffectiveLlmConfig();
   if (cfg.anthropicApiKey) {
@@ -287,7 +343,7 @@ export async function forgetRuleFiles(promptIds: number[]): Promise<void> {
  * current wording. `promptIds` = the rules ticked for the chat; null = Common.
  */
 export async function knowledgeRulesForQuote(brands: string[], promptIds: number[] | null) {
-  if (!brands.length) return { fileIds: [] as string[], inlineText: '', names: [] as string[] };
+  if (!brands.length) return { fileIds: [] as string[], inlineText: '', allText: '', names: [] as string[] };
   const rules = await prisma.brandPrompt.findMany({
     where: {
       company: { name: { in: brands } },
@@ -298,19 +354,25 @@ export async function knowledgeRulesForQuote(brands: string[], promptIds: number
   });
   const fileIds: string[] = [];
   const inline: string[] = [];
+  const all: string[] = [];
   const names: string[] = [];
   for (const r of rules) {
     const title = r.name.trim() || `Rule ${r.id}`;
     names.push(`${r.company.name} · ${title}`);
+    if (r.content.trim()) all.push(`Brand "${r.company.name}" — ${title}:\n${r.content.trim()}`);
     if (r.aiStatus === 'COMPLETED' && r.aiFileId) fileIds.push(r.aiFileId);
     else if (r.content.trim()) inline.push(`Brand "${r.company.name}" — ${title}:\n${r.content.trim()}`);
   }
-  return { fileIds, inlineText: inline.join('\n\n'), names };
+  // allText = every chosen rule's current text (the page search reads it to find what the rules add).
+  return { fileIds, inlineText: inline.join('\n\n'), allText: all.join('\n\n'), names };
 }
 
 /** Mark files / rules whose training was interrupted by a restart as failed (boot). */
 export async function failInterruptedClaudeTraining(): Promise<void> {
   const note = 'Interrupted by a server restart — train again.';
+  // Tell the uploader of each interrupted file (who clicked Train is not known after a restart).
+  const interrupted = await prisma.productDocument.findMany({ where: { aiStatus: 'PROCESSING' }, select: emailDocSelect });
+  for (const doc of interrupted) notify({ event: 'FAILED', document: doc, finishedAt: new Date(), error: note });
   await Promise.all([
     prisma.productDocument.updateMany({ where: { aiStatus: 'PROCESSING' }, data: { aiStatus: 'FAILED', aiError: note } }),
     prisma.brandPrompt.updateMany({ where: { aiStatus: 'PROCESSING' }, data: { aiStatus: 'FAILED', aiError: note } }),

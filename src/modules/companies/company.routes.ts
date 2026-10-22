@@ -85,7 +85,7 @@ companyRouter.post(
   validate(priceListDocParamsSchema, 'params'),
   asyncHandler(async (req, res) => {
     res.status(202).json(
-      await companyService.trainPriceListIntoClaude(Number(req.params.id), Number(req.params.docId)),
+      await companyService.trainPriceListIntoClaude(Number(req.params.id), Number(req.params.docId), req.user!.sub),
     );
   }),
 );
@@ -96,7 +96,7 @@ companyRouter.post(
   requirePermission('companies.edit'),
   validate(idParamSchema, 'params'),
   asyncHandler(async (req, res) => {
-    const count = await trainBrandIntoClaude(Number(req.params.id));
+    const count = await trainBrandIntoClaude(Number(req.params.id), req.user!.sub);
     res.status(202).json({ started: count });
   }),
 );

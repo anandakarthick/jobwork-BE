@@ -15,3 +15,6 @@ scripts/__pycache__/
 # Only the sanitized dump is tracked; any other export in db/ stays local
 db/*.sql
 !db/jobwork_local.sql
+
+# Local embedding model download (scripts/embed.py)
+.cache/

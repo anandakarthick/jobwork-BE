@@ -11,6 +11,8 @@ export interface LlmConfig {
   quoteEngine: 'database' | 'claude';
   /** Anthropic workspace id — required by the Files API with an org-wide key. */
   anthropicWorkspaceId: string;
+  /** Claude engine: send only the matching price-list pages (pgvector search). */
+  pageSearch: boolean;
 }
 
 /**
@@ -28,5 +30,6 @@ export async function getEffectiveLlmConfig(): Promise<LlmConfig> {
     anthropicModel: row?.anthropicModel || env.llm.anthropicModel,
     quoteEngine: row?.quoteEngine === 'claude' ? 'claude' : 'database',
     anthropicWorkspaceId: row?.anthropicWorkspaceId?.trim() || '',
+    pageSearch: Boolean(row?.pageSearch),
   };
 }
